@@ -169,6 +169,10 @@ class LLMProvider(ABC):
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
 
+    def supports_tools(self) -> bool:
+        """Return whether this provider should be routed through the tool loop."""
+        return bool(getattr(self, "supports_configured_tool_calls", True))
+
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Sanitize message content: fix empty blocks, strip internal _meta fields."""

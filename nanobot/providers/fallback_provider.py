@@ -99,6 +99,12 @@ class FallbackProvider(LLMProvider):
     def supports_progress_deltas(self) -> bool:
         return bool(getattr(self._primary, "supports_progress_deltas", False))
 
+    def supports_tools(self) -> bool:
+        supports = getattr(self._primary, "supports_tools", None)
+        if callable(supports):
+            return bool(supports())
+        return bool(getattr(self._primary, "supports_configured_tool_calls", True))
+
     def _primary_available(self) -> bool:
         """Return True if the primary provider is not currently tripped."""
         if self._primary_tripped_at is None:

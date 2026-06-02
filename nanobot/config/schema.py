@@ -122,6 +122,8 @@ class ModelPresetConfig(Base):
     temperature: float = 0.1
     reasoning_effort: str | None = None
     tool_selection: ToolSelectionConfig | None = None
+    plain_chat_when_tools_unsupported: bool = False
+    plain_chat_system_prompt: str = "You are a concise assistant. Reply in plain text only."
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -158,6 +160,8 @@ class AgentDefaults(Base):
         serialization_alias="toolHintMaxLength",
     )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
     reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
+    plain_chat_when_tools_unsupported: bool = False
+    plain_chat_system_prompt: str = "You are a concise assistant. Reply in plain text only."
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
@@ -426,6 +430,8 @@ class Config(BaseSettings):
             context_window_tokens=d.context_window_tokens,
             temperature=d.temperature, reasoning_effort=d.reasoning_effort,
             tool_selection=d.tool_selection,
+            plain_chat_when_tools_unsupported=d.plain_chat_when_tools_unsupported,
+            plain_chat_system_prompt=d.plain_chat_system_prompt,
         )
 
     def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:
