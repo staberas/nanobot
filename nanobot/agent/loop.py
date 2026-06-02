@@ -40,7 +40,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults, ModelPresetConfig, ToolSelectionConfig
+from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.security.workspace_access import (
@@ -193,7 +193,7 @@ class AgentLoop:
         max_tool_result_chars: int | None = None,
         provider_retry_mode: str = "standard",
         tool_hint_max_length: int | None = None,
-        tool_selection: ToolSelectionConfig | None = None,
+        tool_selection: Any | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -384,6 +384,12 @@ class AgentLoop:
         resolved = config.resolve_preset()
         model = extra.pop("model", None) or resolved.model
         context_window_tokens = extra.pop("context_window_tokens", None) or resolved.context_window_tokens
+        tool_selection_config = resolved.tool_selection or defaults.tool_selection
+        tool_selection = (
+            tool_selection_config.to_runtime()
+            if tool_selection_config is not None and hasattr(tool_selection_config, "to_runtime")
+            else tool_selection_config
+        )
         provider_snapshot_loader = extra.pop("provider_snapshot_loader", None)
         preset_snapshot_loader = extra.pop("preset_snapshot_loader", None) or preset_helpers.make_preset_snapshot_loader(
             config,
@@ -401,7 +407,7 @@ class AgentLoop:
             max_tool_result_chars=defaults.max_tool_result_chars,
             provider_retry_mode=defaults.provider_retry_mode,
             tool_hint_max_length=defaults.tool_hint_max_length,
-            tool_selection=resolved.tool_selection or defaults.tool_selection,
+            tool_selection=tool_selection,
             plain_chat_when_tools_unsupported=(
                 resolved.plain_chat_when_tools_unsupported
                 if getattr(resolved, "plain_chat_when_tools_unsupported", False)
@@ -456,7 +462,11 @@ class AgentLoop:
         self.context_window_tokens = context_window_tokens
         preset_cfg = self.model_presets.get(model_preset) if model_preset else None
         if preset_cfg is not None:
-            self.tool_selection = preset_cfg.tool_selection
+            self.tool_selection = (
+                preset_cfg.tool_selection.to_runtime()
+                if preset_cfg.tool_selection is not None and hasattr(preset_cfg.tool_selection, "to_runtime")
+                else preset_cfg.tool_selection
+            )
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)

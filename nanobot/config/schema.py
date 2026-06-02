@@ -110,6 +110,11 @@ class ToolSelectionConfig(Base):
                 raise ValueError(f"toolSelection.{field_name} entries must be non-empty strings")
         return self
 
+    def to_runtime(self) -> Any:
+        from nanobot.agent.tool_selection import ToolSelectionPolicy
+
+        return ToolSelectionPolicy.from_config(self)
+
 
 class ModelPresetConfig(Base):
     """A named set of model + generation parameters for quick switching."""
@@ -168,7 +173,7 @@ class AgentDefaults(Base):
     tool_result_injection_max_chars: int = Field(default=1200, ge=200, le=8000)
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
-    bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
+    bot_icon: str = ""  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     session_ttl_minutes: int = Field(
