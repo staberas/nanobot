@@ -17,7 +17,12 @@ def default_selection_signature(signature: tuple[object, ...] | None) -> tuple[o
 
 
 def configured_model_presets(config: Any) -> dict[str, ModelPresetConfig]:
-    return {**config.model_presets, "default": config.resolve_default_preset()}
+    agent_presets = {
+        name: value
+        for name, value in (getattr(config.agents, "__pydantic_extra__", None) or {}).items()
+        if isinstance(value, ModelPresetConfig)
+    }
+    return {**agent_presets, **config.model_presets, "default": config.resolve_default_preset()}
 
 
 def make_preset_snapshot_loader(

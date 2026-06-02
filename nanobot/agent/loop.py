@@ -37,7 +37,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.config.schema import AgentDefaults, ModelPresetConfig, ToolSelectionConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.security.workspace_access import (
@@ -184,6 +184,7 @@ class AgentLoop:
         max_tool_result_chars: int | None = None,
         provider_retry_mode: str = "standard",
         tool_hint_max_length: int | None = None,
+        tool_selection: ToolSelectionConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -242,6 +243,7 @@ class AgentLoop:
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
         )
+        self.tool_selection = tool_selection
         self.tools_config = _tc
         self.web_config = _tc.web
         self.exec_config = _tc.exec
@@ -370,6 +372,7 @@ class AgentLoop:
             max_tool_result_chars=defaults.max_tool_result_chars,
             provider_retry_mode=defaults.provider_retry_mode,
             tool_hint_max_length=defaults.tool_hint_max_length,
+            tool_selection=resolved.tool_selection or defaults.tool_selection,
             restrict_to_workspace=config.tools.restrict_to_workspace,
             mcp_servers=config.tools.mcp_servers,
             channels_config=config.channels,
@@ -406,6 +409,9 @@ class AgentLoop:
         self.provider = provider
         self.model = model
         self.context_window_tokens = context_window_tokens
+        preset_cfg = self.model_presets.get(model_preset) if model_preset else None
+        if preset_cfg is not None:
+            self.tool_selection = preset_cfg.tool_selection
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
@@ -814,6 +820,8 @@ class AgentLoop:
                 ),
                 goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
                 goal_continue_message=_goal_continue,
+                tool_selection=self.tool_selection,
+                tool_hint_max_length=self.tool_hint_max_length,
             ))
         finally:
             reset_workspace_scope(workspace_token)

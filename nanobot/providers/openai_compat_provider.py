@@ -331,6 +331,7 @@ class OpenAICompatProvider(LLMProvider):
         spec: ProviderSpec | None = None,
         extra_body: dict[str, Any] | None = None,
         api_type: str = "auto",
+        capabilities: Any | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -338,6 +339,7 @@ class OpenAICompatProvider(LLMProvider):
         self._spec = spec
         self._extra_body = extra_body or {}
         self._api_type = api_type if spec and spec.name == "openai" else "auto"
+        self._capabilities = capabilities
 
         if api_key and spec and spec.env_key:
             self._setup_env(api_key, api_base)
@@ -361,6 +363,18 @@ class OpenAICompatProvider(LLMProvider):
         # probe again after _RESPONSES_PROBE_INTERVAL_S seconds.
         self._responses_failures: dict[str, int] = {}
         self._responses_tripped_at: dict[str, float] = {}
+
+    def _capability(self, name: str, default: bool = True) -> bool:
+        caps = self._capabilities
+        if caps is None:
+            return default
+        if isinstance(caps, dict):
+            return bool(caps.get(name, default))
+        return bool(getattr(caps, name, default))
+
+    @property
+    def supports_configured_tool_calls(self) -> bool:
+        return self._capability("tools", True)
 
     def _build_client(self) -> None:
         """Create the OpenAI client using the current module-level AsyncOpenAI."""
@@ -640,7 +654,14 @@ class OpenAICompatProvider(LLMProvider):
         if self._supports_temperature(model_name, reasoning_effort):
             kwargs["temperature"] = temperature
 
-        if spec and getattr(spec, "supports_max_completion_tokens", False):
+        prefer_max_tokens = self._capability("prefer_max_tokens", False)
+        supports_max_completion = self._capability("max_completion_tokens", True)
+        if (
+            spec
+            and getattr(spec, "supports_max_completion_tokens", False)
+            and supports_max_completion
+            and not prefer_max_tokens
+        ):
             kwargs["max_completion_tokens"] = max(1, max_tokens)
         else:
             kwargs["max_tokens"] = max(1, max_tokens)
@@ -691,9 +712,16 @@ class OpenAICompatProvider(LLMProvider):
             if _model_slug(model_name) in _KIMI_THINKING_MODELS:
                 kwargs.pop("reasoning_effort", None)
 
-        if tools:
+        if tools and self._capability("tools", True):
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice or "auto"
+            if self._capability("tool_choice", True):
+                kwargs["tool_choice"] = tool_choice or "auto"
+        elif tools:
+            logger.info(
+                "Provider capabilities disable tool calls for {}; sending plain chat without {} tool schemas",
+                model_name,
+                len(tools),
+            )
 
         # Backfill reasoning_content="" on assistants missing it: DeepSeek
         # thinking mode rejects history otherwise (#3554, #3584); "" reads
@@ -726,6 +754,11 @@ class OpenAICompatProvider(LLMProvider):
         if self._extra_body:
             existing = kwargs.get("extra_body", {})
             kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
+
+        if not self._capability("parallel_tool_calls", True):
+            kwargs.pop("parallel_tool_calls", None)
+        if not self._capability("response_format", True):
+            kwargs.pop("response_format", None)
 
         return kwargs
 
@@ -851,13 +884,25 @@ class OpenAICompatProvider(LLMProvider):
             body["reasoning"] = {"effort": reasoning_effort}
             body["include"] = ["reasoning.encrypted_content"]
 
-        if tools:
+        if tools and self._capability("tools", True):
             body["tools"] = convert_tools(tools)
-            body["tool_choice"] = tool_choice or "auto"
+            if self._capability("tool_choice", True):
+                body["tool_choice"] = tool_choice or "auto"
+        elif tools:
+            logger.info(
+                "Provider capabilities disable tool calls for {}; sending plain Responses request without {} tool schemas",
+                model_name,
+                len(tools),
+            )
 
         extra_body = getattr(self, "_extra_body", {})
         if extra_body:
             body = _merge_responses_extra_body(body, extra_body)
+
+        if not self._capability("parallel_tool_calls", True):
+            body.pop("parallel_tool_calls", None)
+        if not self._capability("response_format", True):
+            body.pop("response_format", None)
 
         return body
 

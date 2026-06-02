@@ -13,6 +13,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.tool_selection import ToolSelectionPolicy, select_tools_for_request
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -108,6 +109,8 @@ class AgentRunSpec:
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
+    tool_selection: ToolSelectionPolicy | Any | None = None
+    tool_hint_max_length: int = 80
 
 
 @dataclass(slots=True)
@@ -646,10 +649,29 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        all_tool_defs = spec.tools.get_definitions()
+        selected = select_tools_for_request(
+            all_tools=all_tool_defs,
+            policy=spec.tool_selection,
+            messages=messages,
+            provider=self.provider,
+            model=spec.model,
+            context_window_tokens=spec.context_window_tokens,
+            description_limit=spec.tool_hint_max_length,
+            session_key=spec.session_key,
+        )
+        model_tools = selected.tools
+        if model_tools and getattr(self.provider, "supports_configured_tool_calls", True) is False:
+            logger.info(
+                "Provider for model {} does not support tool calls; omitting selected tools {}",
+                spec.model,
+                selected.selected_names,
+            )
+            model_tools = None
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=model_tools,
         )
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
