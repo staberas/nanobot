@@ -206,6 +206,9 @@ class AgentLoop:
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        tool_selection: Any | None = None,
+        plain_chat_when_tools_unsupported: bool = False,
+        plain_chat_system_prompt: str | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -242,6 +245,15 @@ class AgentLoop:
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
         )
+        self._base_tool_selection = tool_selection
+        self._base_plain_chat_when_tools_unsupported = plain_chat_when_tools_unsupported
+        self._base_plain_chat_system_prompt = (
+            plain_chat_system_prompt
+            or defaults.plain_chat_system_prompt
+        )
+        self.tool_selection = self._base_tool_selection
+        self.plain_chat_when_tools_unsupported = self._base_plain_chat_when_tools_unsupported
+        self.plain_chat_system_prompt = self._base_plain_chat_system_prompt
         self.tools_config = _tc
         self.web_config = _tc.web
         self.exec_config = _tc.exec
@@ -353,6 +365,22 @@ class AgentLoop:
         resolved = config.resolve_preset()
         model = extra.pop("model", None) or resolved.model
         context_window_tokens = extra.pop("context_window_tokens", None) or resolved.context_window_tokens
+        tool_selection_config = resolved.tool_selection or defaults.tool_selection
+        tool_selection = (
+            tool_selection_config.to_runtime()
+            if tool_selection_config is not None
+            else None
+        )
+        plain_chat_when_tools_unsupported = (
+            resolved.plain_chat_when_tools_unsupported
+            if resolved.plain_chat_when_tools_unsupported is not None
+            else defaults.plain_chat_when_tools_unsupported
+        )
+        plain_chat_system_prompt = (
+            resolved.plain_chat_system_prompt
+            if resolved.plain_chat_system_prompt is not None
+            else defaults.plain_chat_system_prompt
+        )
         provider_snapshot_loader = extra.pop("provider_snapshot_loader", None)
         preset_snapshot_loader = extra.pop("preset_snapshot_loader", None) or preset_helpers.make_preset_snapshot_loader(
             config,
@@ -366,6 +394,9 @@ class AgentLoop:
             max_iterations=defaults.max_tool_iterations,
             max_concurrent_subagents=defaults.max_concurrent_subagents,
             context_window_tokens=context_window_tokens,
+            tool_selection=tool_selection,
+            plain_chat_when_tools_unsupported=plain_chat_when_tools_unsupported,
+            plain_chat_system_prompt=plain_chat_system_prompt,
             context_block_limit=defaults.context_block_limit,
             max_tool_result_chars=defaults.max_tool_result_chars,
             provider_retry_mode=defaults.provider_retry_mode,
@@ -463,11 +494,30 @@ class AgentLoop:
             loader=self._preset_snapshot_loader,
         )
 
+    def _apply_preset_agent_settings(self, name: str | None) -> None:
+        preset = self.model_presets.get(name or "")
+        self.tool_selection = (
+            preset.tool_selection.to_runtime()
+            if preset is not None and preset.tool_selection is not None
+            else self._base_tool_selection
+        )
+        self.plain_chat_when_tools_unsupported = (
+            preset.plain_chat_when_tools_unsupported
+            if preset is not None and preset.plain_chat_when_tools_unsupported is not None
+            else self._base_plain_chat_when_tools_unsupported
+        )
+        self.plain_chat_system_prompt = (
+            preset.plain_chat_system_prompt
+            if preset is not None and preset.plain_chat_system_prompt is not None
+            else self._base_plain_chat_system_prompt
+        )
+
     def set_model_preset(self, name: str | None, *, publish_update: bool = True) -> None:
         """Resolve a preset by name and apply all runtime model dependents."""
         name = preset_helpers.normalize_preset_name(name, self.model_presets)
         snapshot = self._build_model_preset_snapshot(name)
         self._apply_provider_snapshot(snapshot, publish_update=publish_update, model_preset=name)
+        self._apply_preset_agent_settings(name)
         self._active_preset = name
 
     def _register_default_tools(self) -> None:
@@ -589,6 +639,20 @@ class AgentLoop:
             return True
         return False
 
+    def _provider_tools_supported(self) -> bool:
+        value = getattr(self.provider, "supports_tools", True)
+        if callable(value):
+            with suppress(Exception):
+                return bool(value())
+            return True
+        return bool(value)
+
+    def _plain_chat_mode_active(self) -> bool:
+        return bool(
+            self.plain_chat_when_tools_unsupported
+            and not self._provider_tools_supported()
+        )
+
     def _build_initial_messages(
         self,
         msg: InboundMessage,
@@ -598,6 +662,13 @@ class AgentLoop:
     ) -> list[dict[str, Any]]:
         """Build the initial message list for the LLM turn."""
         scope = self.workspace_scopes.for_message(msg, session.metadata)
+        if self._plain_chat_mode_active():
+            return self.context.build_plain_chat_messages(
+                history=history,
+                current_message=image_generation_prompt(msg.content, msg.metadata),
+                media=msg.media if msg.media else None,
+                system_prompt=self.plain_chat_system_prompt,
+            )
         return self.context.build_messages(
             history=history,
             current_message=image_generation_prompt(msg.content, msg.metadata),
@@ -673,6 +744,7 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        current_message: str | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -814,6 +886,9 @@ class AgentLoop:
                 ),
                 goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
                 goal_continue_message=_goal_continue,
+                tool_selection=self.tool_selection,
+                plain_chat=self._plain_chat_mode_active(),
+                selection_text=current_message,
             ))
         finally:
             reset_workspace_scope(workspace_token)
@@ -1372,10 +1447,13 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
-        await self.consolidator.maybe_consolidate_by_tokens(
-            ctx.session,
-            replay_max_messages=self._max_messages,
-        )
+        if not self._plain_chat_mode_active():
+            await self.consolidator.maybe_consolidate_by_tokens(
+                ctx.session,
+                replay_max_messages=self._max_messages,
+            )
+        else:
+            logger.info("Provider tools=false; using plain-chat mode")
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
@@ -1437,6 +1515,7 @@ class AgentLoop:
             metadata=ctx.msg.metadata,
             session_key=ctx.session_key,
             pending_queue=ctx.pending_queue,
+            current_message=ctx.msg.content,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
@@ -1475,12 +1554,13 @@ class AgentLoop:
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
-        self._schedule_background(
-            self.consolidator.maybe_consolidate_by_tokens(
-                ctx.session,
-                replay_max_messages=self._max_messages,
+        if not self._plain_chat_mode_active():
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(
+                    ctx.session,
+                    replay_max_messages=self._max_messages,
+                )
             )
-        )
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:

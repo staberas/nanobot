@@ -331,6 +331,7 @@ class OpenAICompatProvider(LLMProvider):
         spec: ProviderSpec | None = None,
         extra_body: dict[str, Any] | None = None,
         api_type: str = "auto",
+        capabilities: Any | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -338,6 +339,7 @@ class OpenAICompatProvider(LLMProvider):
         self._spec = spec
         self._extra_body = extra_body or {}
         self._api_type = api_type if spec and spec.name == "openai" else "auto"
+        self._capabilities = capabilities
 
         if api_key and spec and spec.env_key:
             self._setup_env(api_key, api_base)
@@ -609,6 +611,48 @@ class OpenAICompatProvider(LLMProvider):
         name = model_name.lower()
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
 
+
+    def _capability(self, name: str) -> Any:
+        caps = getattr(self, "_capabilities", None)
+        if caps is None:
+            return None
+        if isinstance(caps, dict):
+            return caps.get(name)
+        return getattr(caps, name, None)
+
+    @property
+    def supports_tools(self) -> bool:
+        return self._tools_supported()
+
+    def _tools_supported(self) -> bool:
+        return self._capability("tools") is not False
+
+    def _tool_choice_supported(self) -> bool:
+        return self._capability("tool_choice") is not False
+
+    def _prefer_max_tokens(self) -> bool:
+        return bool(self._capability("prefer_max_tokens")) or self._capability("max_completion_tokens") is False
+
+    def _filter_capability_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        extra_body = body.get("extra_body")
+        if self._capability("parallel_tool_calls") is False:
+            body.pop("parallel_tool_calls", None)
+            if isinstance(extra_body, dict):
+                extra_body.pop("parallel_tool_calls", None)
+        if self._capability("response_format") is False:
+            body.pop("response_format", None)
+            if isinstance(extra_body, dict):
+                extra_body.pop("response_format", None)
+        if isinstance(extra_body, dict) and not extra_body:
+            body.pop("extra_body", None)
+        if not self._tools_supported():
+            if body.pop("tools", None) is not None:
+                logger.info("Provider capability tools=false; omitting OpenAI tool schemas")
+            body.pop("tool_choice", None)
+        elif not self._tool_choice_supported():
+            body.pop("tool_choice", None)
+        return body
+
     def _build_kwargs(
         self,
         messages: list[dict[str, Any]],
@@ -640,7 +684,11 @@ class OpenAICompatProvider(LLMProvider):
         if self._supports_temperature(model_name, reasoning_effort):
             kwargs["temperature"] = temperature
 
-        if spec and getattr(spec, "supports_max_completion_tokens", False):
+        if (
+            spec
+            and getattr(spec, "supports_max_completion_tokens", False)
+            and not self._prefer_max_tokens()
+        ):
             kwargs["max_completion_tokens"] = max(1, max_tokens)
         else:
             kwargs["max_tokens"] = max(1, max_tokens)
@@ -691,9 +739,12 @@ class OpenAICompatProvider(LLMProvider):
             if _model_slug(model_name) in _KIMI_THINKING_MODELS:
                 kwargs.pop("reasoning_effort", None)
 
-        if tools:
+        if tools and self._tools_supported():
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = tool_choice or "auto"
+            if self._tool_choice_supported():
+                kwargs["tool_choice"] = tool_choice or "auto"
+        elif tools:
+            logger.info("Provider capability tools=false; using plain chat without tool schemas")
 
         # Backfill reasoning_content="" on assistants missing it: DeepSeek
         # thinking mode rejects history otherwise (#3554, #3584); "" reads
@@ -727,7 +778,7 @@ class OpenAICompatProvider(LLMProvider):
             existing = kwargs.get("extra_body", {})
             kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
 
-        return kwargs
+        return self._filter_capability_body(kwargs)
 
     def _should_use_responses_api(
         self,
@@ -851,15 +902,18 @@ class OpenAICompatProvider(LLMProvider):
             body["reasoning"] = {"effort": reasoning_effort}
             body["include"] = ["reasoning.encrypted_content"]
 
-        if tools:
+        if tools and self._tools_supported():
             body["tools"] = convert_tools(tools)
-            body["tool_choice"] = tool_choice or "auto"
+            if self._tool_choice_supported():
+                body["tool_choice"] = tool_choice or "auto"
+        elif tools:
+            logger.info("Provider capability tools=false; using plain Responses request without tool schemas")
 
         extra_body = getattr(self, "_extra_body", {})
         if extra_body:
             body = _merge_responses_extra_body(body, extra_body)
 
-        return body
+        return self._filter_capability_body(body)
 
     # ------------------------------------------------------------------
     # Response parsing

@@ -176,6 +176,28 @@ class ContextBuilder:
             return content.strip() == tpl.strip()
         return False
 
+
+    def build_plain_chat_messages(
+        self,
+        history: list[dict[str, Any]],
+        current_message: str,
+        *,
+        system_prompt: str,
+        media: list[str] | None = None,
+        current_role: str = "user",
+    ) -> list[dict[str, Any]]:
+        """Build a minimal non-tool chat prompt for small/tool-less providers."""
+        messages = [{"role": "system", "content": system_prompt}]
+        messages.extend(history)
+        user_content = self._build_user_content(current_message, media)
+        if messages[-1].get("role") == current_role:
+            last = dict(messages[-1])
+            last["content"] = self._merge_message_content(last.get("content"), user_content)
+            messages[-1] = last
+        else:
+            messages.append({"role": current_role, "content": user_content})
+        return messages
+
     def build_messages(
         self,
         history: list[dict[str, Any]],

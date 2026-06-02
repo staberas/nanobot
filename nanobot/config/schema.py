@@ -91,6 +91,39 @@ class InlineFallbackConfig(Base):
 FallbackCandidate = str | InlineFallbackConfig
 
 
+class ToolSelectionConfig(Base):
+    """Per-agent tool schema selection budget."""
+
+    enabled: bool = False
+    mode: Literal["heuristic"] = "heuristic"
+    max_tools: int = Field(default=4, ge=0, le=64)
+    always_include: list[str] = Field(default_factory=list)
+    allow: list[str] = Field(default_factory=list)
+    deny: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_names(self) -> "ToolSelectionConfig":
+        for field_name in ("always_include", "allow", "deny"):
+            values = getattr(self, field_name)
+            bad = [value for value in values if not isinstance(value, str) or not value.strip()]
+            if bad:
+                raise ValueError(f"toolSelection.{field_name} entries must be non-empty strings")
+            setattr(self, field_name, list(dict.fromkeys(value.strip() for value in values)))
+        return self
+
+    def to_runtime(self) -> Any:
+        from nanobot.agent.tool_selection import ToolSelectionConfig as RuntimeToolSelectionConfig
+
+        return RuntimeToolSelectionConfig(
+            enabled=self.enabled,
+            mode=self.mode,
+            max_tools=self.max_tools,
+            always_include=tuple(self.always_include),
+            allow=tuple(self.allow),
+            deny=tuple(self.deny),
+        )
+
+
 class ModelPresetConfig(Base):
     """A named set of model + generation parameters for quick switching."""
 
@@ -101,6 +134,9 @@ class ModelPresetConfig(Base):
     context_window_tokens: int = 65_536
     temperature: float = 0.1
     reasoning_effort: str | None = None
+    tool_selection: ToolSelectionConfig | None = None
+    plain_chat_when_tools_unsupported: bool | None = None
+    plain_chat_system_prompt: str | None = None
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -160,12 +196,28 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    tool_selection: ToolSelectionConfig | None = None
+    plain_chat_when_tools_unsupported: bool = False
+    plain_chat_system_prompt: str = "You are a concise assistant. Reply in plain text only."
 
 
 class AgentsConfig(Base):
     """Agent configuration."""
 
+    model_config = ConfigDict(extra="allow")
+
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+
+
+class ProviderCapabilitiesConfig(Base):
+    """Optional OpenAI-compatible request capability overrides."""
+
+    tools: bool | None = None
+    tool_choice: bool | None = None
+    parallel_tool_calls: bool | None = None
+    response_format: bool | None = None
+    max_completion_tokens: bool | None = None
+    prefer_max_tokens: bool = False
 
 
 class ProviderConfig(Base):
@@ -176,6 +228,7 @@ class ProviderConfig(Base):
     api_type: Literal["auto", "chat_completions", "responses"] = "auto"  # Request API surface
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     extra_body: dict[str, Any] | None = None  # Extra provider request fields; shape depends on provider/API surface
+    capabilities: ProviderCapabilitiesConfig = Field(default_factory=ProviderCapabilitiesConfig)
 
 
 class BedrockProviderConfig(ProviderConfig):
@@ -187,6 +240,8 @@ class BedrockProviderConfig(ProviderConfig):
 
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
+
+    model_config = ConfigDict(extra="allow")
 
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
@@ -234,6 +289,12 @@ class ProvidersConfig(Base):
             provider = getattr(self, name, None)
             if isinstance(provider, ProviderConfig) and provider.api_type != "auto":
                 raise ValueError("providers.<name>.api_type is only supported for providers.openai")
+        for name, provider in self.__pydantic_extra__.items() if self.__pydantic_extra__ else []:
+            if isinstance(provider, dict):
+                provider = ProviderConfig.model_validate(provider)
+                setattr(self, name, provider)
+            if isinstance(provider, ProviderConfig) and provider.api_type != "auto":
+                raise ValueError("providers.<custom>.api_type is only supported for providers.openai")
         return self
 
 
@@ -332,6 +393,14 @@ class Config(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_model_preset(self) -> "Config":
+        agent_presets = self.agents.__pydantic_extra__ or {}
+        for preset_name, preset_value in agent_presets.items():
+            if isinstance(preset_value, ModelPresetConfig):
+                preset = preset_value
+            else:
+                preset = ModelPresetConfig.model_validate(preset_value)
+                setattr(self.agents, preset_name, preset)
+            self.model_presets.setdefault(preset_name, preset)
         if "default" in self.model_presets:
             raise ValueError("model_preset name 'default' is reserved for agents.defaults")
         name = self.agents.defaults.model_preset
@@ -349,6 +418,9 @@ class Config(BaseSettings):
             model=d.model, provider=d.provider, max_tokens=d.max_tokens,
             context_window_tokens=d.context_window_tokens,
             temperature=d.temperature, reasoning_effort=d.reasoning_effort,
+            tool_selection=d.tool_selection,
+            plain_chat_when_tools_unsupported=d.plain_chat_when_tools_unsupported,
+            plain_chat_system_prompt=d.plain_chat_system_prompt,
         )
 
     def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:
@@ -380,7 +452,11 @@ class Config(BaseSettings):
             if spec:
                 p = getattr(self.providers, spec.name, None)
                 return (p, spec.name) if p else (None, None)
-            return None, None
+            p = getattr(self.providers, forced, None)
+            if isinstance(p, dict):
+                p = ProviderConfig.model_validate(p)
+                setattr(self.providers, forced, p)
+            return (p, forced) if isinstance(p, ProviderConfig) else (None, None)
 
         model_lower = (model or resolved.model).lower()
         model_normalized = model_lower.replace("-", "_")
