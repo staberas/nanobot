@@ -48,7 +48,7 @@ def _make_provider_core(
             raise ValueError("Azure OpenAI requires api_key and api_base in config.")
     elif backend == "openai_compat" and not model.startswith("bedrock/"):
         needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
+        exempt = (spec and (spec.is_oauth or spec.is_local or spec.is_direct)) or (p and p.api_base)
         if needs_key and not exempt:
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
 
@@ -99,6 +99,7 @@ def _make_provider_core(
             spec=spec,
             extra_body=p.extra_body if p else None,
             api_type=p.api_type if p and provider_name == "openai" else "auto",
+            capabilities=p.capabilities if p else None,
         )
 
     provider.generation = resolved.to_generation_settings()
@@ -185,6 +186,7 @@ def provider_signature(
             fp.extra_headers if fp else None,
             fp.extra_body if fp else None,
             fp.api_type if fp else "auto",
+            fp.capabilities.model_dump() if fp else None,
             getattr(fp, "region", None) if fp else None,
             getattr(fp, "profile", None) if fp else None,
             fallback.max_tokens,
@@ -202,6 +204,7 @@ def provider_signature(
         p.extra_headers if p else None,
         p.extra_body if p else None,
         p.api_type if p else "auto",
+        p.capabilities.model_dump() if p else None,
         getattr(p, "region", None) if p else None,
         getattr(p, "profile", None) if p else None,
         resolved.max_tokens,

@@ -91,6 +91,26 @@ class InlineFallbackConfig(Base):
 FallbackCandidate = str | InlineFallbackConfig
 
 
+class ToolSelectionConfig(Base):
+    """Config-driven model-visible tool selection policy."""
+
+    enabled: bool = False
+    mode: Literal["heuristic"] = "heuristic"
+    max_tools: int = Field(default=4, ge=0, le=64)
+    always_include: list[str] = Field(default_factory=list)
+    allow: list[str] = Field(default_factory=list)
+    deny: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_names(self) -> "ToolSelectionConfig":
+        for field_name in ("always_include", "allow", "deny"):
+            values = getattr(self, field_name)
+            invalid = [name for name in values if not isinstance(name, str) or not name.strip()]
+            if invalid:
+                raise ValueError(f"toolSelection.{field_name} entries must be non-empty strings")
+        return self
+
+
 class ModelPresetConfig(Base):
     """A named set of model + generation parameters for quick switching."""
 
@@ -101,6 +121,7 @@ class ModelPresetConfig(Base):
     context_window_tokens: int = 65_536
     temperature: float = 0.1
     reasoning_effort: str | None = None
+    tool_selection: ToolSelectionConfig | None = None
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -160,12 +181,41 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    tool_selection: ToolSelectionConfig | None = None
 
 
 class AgentsConfig(Base):
     """Agent configuration."""
 
+    model_config = ConfigDict(extra="allow")
+
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_agent_presets(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            coerced = dict(data)
+            for key, value in list(coerced.items()):
+                if key != "defaults" and isinstance(value, dict):
+                    coerced[key] = ModelPresetConfig(**value)
+            return coerced
+        return data
+
+    def agent_preset(self, name: str) -> ModelPresetConfig | None:
+        value = getattr(self, name, None)
+        return value if isinstance(value, ModelPresetConfig) else None
+
+
+class ProviderCapabilitiesConfig(Base):
+    """Provider-specific OpenAI-compatible payload capability flags."""
+
+    tools: bool = True
+    tool_choice: bool = True
+    parallel_tool_calls: bool = True
+    response_format: bool = True
+    max_completion_tokens: bool = True
+    prefer_max_tokens: bool = False
 
 
 class ProviderConfig(Base):
@@ -176,6 +226,7 @@ class ProviderConfig(Base):
     api_type: Literal["auto", "chat_completions", "responses"] = "auto"  # Request API surface
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     extra_body: dict[str, Any] | None = None  # Extra provider request fields; shape depends on provider/API surface
+    capabilities: ProviderCapabilitiesConfig = Field(default_factory=ProviderCapabilitiesConfig)
 
 
 class BedrockProviderConfig(ProviderConfig):
@@ -187,6 +238,20 @@ class BedrockProviderConfig(ProviderConfig):
 
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_custom_providers(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            known = set(cls.model_fields)
+            coerced = dict(data)
+            for key, value in list(coerced.items()):
+                if key not in known and isinstance(value, dict):
+                    coerced[key] = ProviderConfig(**value)
+            return coerced
+        return data
 
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     azure_openai: ProviderConfig = Field(default_factory=ProviderConfig)  # Azure OpenAI (model = deployment name)
@@ -335,11 +400,22 @@ class Config(BaseSettings):
         if "default" in self.model_presets:
             raise ValueError("model_preset name 'default' is reserved for agents.defaults")
         name = self.agents.defaults.model_preset
-        if name and name != "default" and name not in self.model_presets:
-            raise ValueError(f"model_preset {name!r} not found in model_presets")
+        if (
+            name
+            and name != "default"
+            and name not in self.model_presets
+            and self.agents.agent_preset(name) is None
+        ):
+            raise ValueError(f"model_preset {name!r} not found in model_presets or agents")
         for fallback in self.agents.defaults.fallback_models:
-            if isinstance(fallback, str) and fallback not in self.model_presets:
-                raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")
+            if (
+                isinstance(fallback, str)
+                and fallback not in self.model_presets
+                and self.agents.agent_preset(fallback) is None
+            ):
+                raise ValueError(
+                    f"fallback_models entry {fallback!r} not found in model_presets or agents"
+                )
         return self
 
     def resolve_default_preset(self) -> ModelPresetConfig:
@@ -349,6 +425,7 @@ class Config(BaseSettings):
             model=d.model, provider=d.provider, max_tokens=d.max_tokens,
             context_window_tokens=d.context_window_tokens,
             temperature=d.temperature, reasoning_effort=d.reasoning_effort,
+            tool_selection=d.tool_selection,
         )
 
     def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:
@@ -356,9 +433,12 @@ class Config(BaseSettings):
         name = self.agents.defaults.model_preset if name is None else name
         if not name or name == "default":
             return self.resolve_default_preset()
-        if name not in self.model_presets:
-            raise KeyError(f"model_preset {name!r} not found in model_presets")
-        return self.model_presets[name]
+        if name in self.model_presets:
+            return self.model_presets[name]
+        agent_preset = self.agents.agent_preset(name)
+        if agent_preset is not None:
+            return agent_preset
+        raise KeyError(f"model_preset {name!r} not found in model_presets or agents")
 
     @property
     def workspace_path(self) -> Path:
@@ -380,6 +460,9 @@ class Config(BaseSettings):
             if spec:
                 p = getattr(self.providers, spec.name, None)
                 return (p, spec.name) if p else (None, None)
+            p = getattr(self.providers, forced, None)
+            if isinstance(p, ProviderConfig):
+                return p, forced
             return None, None
 
         model_lower = (model or resolved.model).lower()
