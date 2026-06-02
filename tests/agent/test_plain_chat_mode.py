@@ -47,10 +47,14 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
     defaults = AgentDefaults.model_validate({
         "plainChatWhenToolsUnsupported": True,
         "plainChatSystemPrompt": "plain only",
+        "toolExecutionMode": "prompt_injection",
+        "toolResultInjectionMaxChars": 1000,
     })
 
     assert defaults.plain_chat_when_tools_unsupported is True
     assert defaults.plain_chat_system_prompt == "plain only"
+    assert defaults.tool_execution_mode == "prompt_injection"
+    assert defaults.tool_result_injection_max_chars == 1000
 
 
 def test_plain_chat_bypasses_tool_loop_when_provider_lacks_tools(tmp_path) -> None:
@@ -93,6 +97,72 @@ def test_plain_chat_bypasses_tool_loop_when_provider_lacks_tools(tmp_path) -> No
         prompt_text = "\n".join(str(message.get("content", "")) for message in call["messages"])
         assert "tool" not in prompt_text.lower()
         assert "function" not in prompt_text.lower()
+    asyncio.run(run())
+
+def test_prompt_injection_web_search_runs_internally_without_tool_schema(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(supports_tools=False)
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="prompt_injection",
+            tool_result_injection_max_chars=1200,
+            tool_selection=AgentDefaults.model_validate({
+                "toolSelection": {
+                    "enabled": True,
+                    "mode": "heuristic",
+                    "maxTools": 1,
+                    "allow": ["web_search"],
+                }
+            }).tool_selection,
+        )
+        loop.context.build_messages = AsyncMock(side_effect=AssertionError("tool prompt built"))
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+        loop.tools.get_definitions = MagicMock(return_value=[{
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }])
+        loop.tools.execute = AsyncMock(
+            return_value='1. Jason Kolios — example snippet — https://example.com/jason'
+        )
+
+        result = await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="room",
+                content="can you search jason kolios?",
+            )
+        )
+
+        assert result is not None
+        assert result.content == "ok"
+        loop.tools.execute.assert_awaited_once_with("web_search", {"query": "jason kolios", "count": 3})
+        assert len(provider.calls) == 1
+        call = provider.calls[0]
+        assert call["tools"] is None
+        assert "tool_choice" not in call
+        assert "response_format" not in call
+        assert all("_prompt_injection" not in message for message in call["messages"])
+        prompt_text = "\n".join(str(message.get("content", "")) for message in call["messages"])
+        assert 'Search results for "jason kolios"' in prompt_text
+        assert "Jason Kolios" in prompt_text
+        assert "Answer the user using only these search results" in prompt_text
+        prompt_tokens, _ = estimate_prompt_tokens_chain(provider, "fake-small", call["messages"], None)
+        assert prompt_tokens < 2048
     asyncio.run(run())
 
 def test_plain_chat_new_clears_stale_history(tmp_path) -> None:
