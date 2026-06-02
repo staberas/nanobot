@@ -245,3 +245,21 @@ def test_match_provider_routes_forced_novita_model_api_models() -> None:
 
     assert config.get_provider_name() == "novita"
     assert config.get_api_base() == "https://api.novita.ai/openai"
+
+
+def test_agents_extra_keys_act_as_model_presets() -> None:
+    config = Config.model_validate({
+        "providers": {
+            "rkllama": {"apiBase": "http://192.168.100.23:30082/v1"},
+            "local-big": {"apiBase": "http://192.168.100.50:8000/v1"},
+            "openrouter": {"apiKey": "sk-or-test"},
+        },
+        "agents": {
+            "defaults": {"provider": "rkllama", "model": "Qwen3-4B-w8a8-npu"},
+            "powerful": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.5"},
+            "local-big-agent": {"provider": "local-big", "model": "qwen2.5-14b-instruct"},
+        },
+    })
+
+    assert config.resolve_preset("powerful").provider == "openrouter"
+    assert config.resolve_preset("local-big-agent").model == "qwen2.5-14b-instruct"

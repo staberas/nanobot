@@ -169,6 +169,11 @@ class LLMProvider(ABC):
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
 
+    @property
+    def supports_tools(self) -> bool:
+        """Whether this provider should receive tool-call schemas by default."""
+        return True
+
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Sanitize message content: fix empty blocks, strip internal _meta fields."""

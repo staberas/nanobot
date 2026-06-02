@@ -13,6 +13,11 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.tool_selection import (
+    ToolSelectionConfig,
+    log_tool_selection,
+    select_tool_definitions,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -108,6 +113,9 @@ class AgentRunSpec:
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
+    tool_selection: ToolSelectionConfig | None = None
+    plain_chat: bool = False
+    selection_text: str | None = None
 
 
 @dataclass(slots=True)
@@ -285,6 +293,9 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+
+        if spec.plain_chat:
+            return await self._run_plain_chat(spec, messages, hook)
 
         for iteration in range(spec.max_iterations):
             try:
@@ -604,6 +615,56 @@ class AgentRunner:
             had_injections=had_injections,
         )
 
+
+    async def _run_plain_chat(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+        hook: AgentHook,
+    ) -> AgentRunResult:
+        """Run one no-tools chat request for providers that cannot use tool calls."""
+        estimate, _ = estimate_prompt_tokens_chain(
+            self.provider,
+            spec.model,
+            messages,
+            None,
+        )
+        logger.info(
+            "Plain-chat prompt tokens {}/{}",
+            estimate,
+            spec.context_window_tokens if spec.context_window_tokens is not None else "?",
+        )
+        context = AgentHookContext(iteration=0, messages=messages)
+        await hook.before_iteration(context)
+        kwargs = self._build_request_kwargs(spec, messages, tools=None)
+        response = await self.provider.chat_with_retry(**kwargs)
+        raw_usage = self._usage_dict(response.usage)
+        context.response = response
+        context.usage = dict(raw_usage)
+        reasoning_text, cleaned_content = extract_reasoning(
+            response.reasoning_content,
+            response.thinking_blocks,
+            response.content,
+        )
+        if reasoning_text:
+            await hook.emit_reasoning(reasoning_text)
+            await hook.emit_reasoning_end()
+            context.streamed_reasoning = True
+        final_content = cleaned_content
+        stop_reason = "error" if response.finish_reason == "error" else "completed"
+        if final_content:
+            self._append_final_message(messages, final_content)
+        return AgentRunResult(
+            final_content=final_content,
+            messages=messages,
+            usage={
+                "prompt_tokens": raw_usage.get("prompt_tokens", 0),
+                "completion_tokens": raw_usage.get("completion_tokens", 0),
+            },
+            stop_reason=stop_reason,
+            error=final_content if stop_reason == "error" else None,
+        )
+
     def _build_request_kwargs(
         self,
         spec: AgentRunSpec,
@@ -646,10 +707,33 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        all_tools = spec.tools.get_definitions()
+        selected_tools = select_tool_definitions(
+            all_tools,
+            messages,
+            spec.tool_selection,
+            session_key=spec.session_key,
+            context_window_tokens=spec.context_window_tokens,
+            prompt_override=spec.selection_text,
+            log_selection=False,
+        )
+        estimate, _ = estimate_prompt_tokens_chain(
+            self.provider,
+            spec.model,
+            messages,
+            selected_tools,
+        )
+        log_tool_selection(
+            selected_tools,
+            registered_count=len(all_tools),
+            session_key=spec.session_key,
+            context_window_tokens=spec.context_window_tokens,
+            estimate_tokens=estimate,
+        )
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=selected_tools,
         )
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
@@ -1252,6 +1336,23 @@ class AgentRunner:
                 updated[idx]["content"] = normalized
         return updated
 
+
+    def _selected_tool_definitions_for_budget(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        definitions = spec.tools.get_definitions()
+        return select_tool_definitions(
+            definitions,
+            messages,
+            spec.tool_selection,
+            session_key=spec.session_key,
+            context_window_tokens=spec.context_window_tokens,
+            prompt_override=spec.selection_text,
+            log_selection=False,
+        )
+
     def _snip_history(
         self,
         spec: AgentRunSpec,
@@ -1274,7 +1375,7 @@ class AgentRunner:
             self.provider,
             spec.model,
             messages,
-            spec.tools.get_definitions(),
+            self._selected_tool_definitions_for_budget(spec, messages),
         )
         if estimate <= budget:
             return messages
@@ -1289,7 +1390,7 @@ class AgentRunner:
             self.provider,
             spec.model,
             system_messages,
-            spec.tools.get_definitions(),
+            self._selected_tool_definitions_for_budget(spec, system_messages),
         )
         remaining_budget = max(0, budget - max(system_tokens, fixed_tokens))
         kept: list[dict[str, Any]] = []
