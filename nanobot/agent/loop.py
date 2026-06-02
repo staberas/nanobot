@@ -38,7 +38,7 @@ from nanobot.bus.runtime_events import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig, ToolSelectionConfig
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.security.workspace_access import (
     WorkspaceScopeResolver,
@@ -53,7 +53,7 @@ from nanobot.session.goal_state import (
 )
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
-from nanobot.utils.helpers import image_placeholder_text
+from nanobot.utils.helpers import estimate_message_tokens, image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.image_generation_intent import image_generation_prompt
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -109,6 +109,7 @@ class TurnContext:
     all_messages: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = ""
     had_injections: bool = False
+    plain_chat: bool = False
 
     user_persisted_early: bool = False
     save_skip: int = 0
@@ -207,6 +208,8 @@ class AgentLoop:
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
+        plain_chat_when_tools_unsupported: bool | None = None,
+        plain_chat_system_prompt: str | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -244,6 +247,16 @@ class AgentLoop:
             else defaults.tool_hint_max_length
         )
         self.tool_selection = tool_selection
+        self.plain_chat_when_tools_unsupported = (
+            plain_chat_when_tools_unsupported
+            if plain_chat_when_tools_unsupported is not None
+            else defaults.plain_chat_when_tools_unsupported
+        )
+        self.plain_chat_system_prompt = (
+            plain_chat_system_prompt
+            if plain_chat_system_prompt is not None
+            else defaults.plain_chat_system_prompt
+        )
         self.tools_config = _tc
         self.web_config = _tc.web
         self.exec_config = _tc.exec
@@ -373,6 +386,16 @@ class AgentLoop:
             provider_retry_mode=defaults.provider_retry_mode,
             tool_hint_max_length=defaults.tool_hint_max_length,
             tool_selection=resolved.tool_selection or defaults.tool_selection,
+            plain_chat_when_tools_unsupported=(
+                resolved.plain_chat_when_tools_unsupported
+                if getattr(resolved, "plain_chat_when_tools_unsupported", False)
+                else defaults.plain_chat_when_tools_unsupported
+            ),
+            plain_chat_system_prompt=(
+                resolved.plain_chat_system_prompt
+                if getattr(resolved, "plain_chat_system_prompt", None)
+                else defaults.plain_chat_system_prompt
+            ),
             restrict_to_workspace=config.tools.restrict_to_workspace,
             mcp_servers=config.tools.mcp_servers,
             channels_config=config.channels,
@@ -617,6 +640,101 @@ class AgentLoop:
             runtime_state=self,
             inbound_message=msg,
         )
+
+    def _provider_supports_tools(self) -> bool:
+        supports = getattr(self.provider, "supports_tools", None)
+        if callable(supports):
+            return bool(supports())
+        return bool(getattr(self.provider, "supports_configured_tool_calls", True))
+
+    def _should_use_plain_chat(self) -> bool:
+        # Providers that explicitly disable tools cannot use the agent/tool state
+        # machine.  Route them early so maxToolIterations=0 still allows one
+        # ordinary LLM request instead of exhausting the tool-loop budget.
+        return not self._provider_supports_tools()
+
+    def _plain_chat_history_budget(self) -> int:
+        if self.context_window_tokens <= 0:
+            return 0
+        max_output = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
+        try:
+            reserved_output = max(1, int(max_output))
+        except (TypeError, ValueError):
+            reserved_output = 4096
+        fixed_messages = [
+            {"role": "system", "content": self.plain_chat_system_prompt},
+            {"role": "user", "content": ""},
+        ]
+        fixed = sum(estimate_message_tokens(message) for message in fixed_messages)
+        budget = self.context_window_tokens - reserved_output - fixed - 64
+        return max(0, budget)
+
+    @staticmethod
+    def _plain_chat_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        plain: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            if role not in {"user", "assistant"}:
+                continue
+            if message.get("tool_calls") or message.get("tool_call_id"):
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = [
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                content = "\n".join(part for part in parts if part)
+            elif not isinstance(content, str):
+                content = str(content) if content is not None else ""
+            if not content.strip():
+                continue
+            plain.append({"role": role, "content": content})
+        return plain
+
+    def _build_plain_chat_messages(
+        self,
+        msg: InboundMessage,
+        session: Session,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        history = session.get_history(
+            max_messages=self._max_messages,
+            max_tokens=self._plain_chat_history_budget(),
+            include_timestamps=False,
+        )
+        plain_history = self._plain_chat_history(history)
+        messages = [{"role": "system", "content": self.plain_chat_system_prompt}]
+        messages.extend(plain_history)
+        messages.append({"role": "user", "content": msg.content})
+        return messages, plain_history
+
+    async def _run_plain_chat(
+        self,
+        ctx: TurnContext,
+    ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        kwargs: dict[str, Any] = {
+            "messages": ctx.initial_messages,
+            "tools": None,
+            "model": self.model,
+            "retry_mode": self.provider_retry_mode,
+            "on_retry_wait": ctx.on_retry_wait,
+        }
+        response: LLMResponse = await self.provider.chat_with_retry(**kwargs)
+        self._last_usage = dict(response.usage or {})
+        if response.finish_reason == "error":
+            final = response.content or "Sorry, I encountered an error calling the AI model."
+            stop_reason = "error"
+        else:
+            final = response.content or EMPTY_FINAL_RESPONSE_MESSAGE
+            stop_reason = "completed" if final.strip() else "empty_final_response"
+        if ctx.on_stream is not None and stop_reason != "error":
+            await ctx.on_stream(final)
+            if ctx.on_stream_end is not None:
+                await ctx.on_stream_end(resuming=False)
+        messages = list(ctx.initial_messages)
+        messages.append({"role": "assistant", "content": final})
+        return final, [], messages, stop_reason, False
 
     async def _dispatch_command_inline(
         self,
@@ -1380,10 +1498,12 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
-        await self.consolidator.maybe_consolidate_by_tokens(
-            ctx.session,
-            replay_max_messages=self._max_messages,
-        )
+        ctx.plain_chat = self._should_use_plain_chat()
+        if not ctx.plain_chat:
+            await self.consolidator.maybe_consolidate_by_tokens(
+                ctx.session,
+                replay_max_messages=self._max_messages,
+            )
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,
@@ -1400,18 +1520,22 @@ class AgentLoop:
             "max_tokens": self._replay_token_budget(),
             "include_timestamps": True,
         }
-        ctx.history = ctx.session.get_history(**_hist_kwargs)
         self._runtime_events().record_turn_runtime(
             ctx.session_key,
             self.llm_runtime(),
         )
 
-        ctx.initial_messages = self._build_initial_messages(
-            ctx.msg,
-            ctx.session,
-            ctx.history,
-            ctx.pending_summary,
-        )
+        if ctx.plain_chat:
+            ctx.initial_messages, ctx.history = self._build_plain_chat_messages(ctx.msg, ctx.session)
+            ctx.save_skip = len(ctx.initial_messages)
+        else:
+            ctx.history = ctx.session.get_history(**_hist_kwargs)
+            ctx.initial_messages = self._build_initial_messages(
+                ctx.msg,
+                ctx.session,
+                ctx.history,
+                ctx.pending_summary,
+            )
         ctx.user_persisted_early = self._persist_user_message_early(
             ctx.msg, ctx.session
         )
@@ -1432,20 +1556,23 @@ class AgentLoop:
             "running",
             started_at=ctx.visible_run_started_at,
         )
-        result = await self._run_agent_loop(
-            ctx.initial_messages,
-            on_progress=ctx.on_progress,
-            on_stream=ctx.on_stream,
-            on_stream_end=ctx.on_stream_end,
-            on_retry_wait=ctx.on_retry_wait,
-            session=ctx.session,
-            channel=ctx.msg.channel,
-            chat_id=ctx.msg.chat_id,
-            message_id=ctx.msg.metadata.get("message_id"),
-            metadata=ctx.msg.metadata,
-            session_key=ctx.session_key,
-            pending_queue=ctx.pending_queue,
-        )
+        if ctx.plain_chat:
+            result = await self._run_plain_chat(ctx)
+        else:
+            result = await self._run_agent_loop(
+                ctx.initial_messages,
+                on_progress=ctx.on_progress,
+                on_stream=ctx.on_stream,
+                on_stream_end=ctx.on_stream_end,
+                on_retry_wait=ctx.on_retry_wait,
+                session=ctx.session,
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                message_id=ctx.msg.metadata.get("message_id"),
+                metadata=ctx.msg.metadata,
+                session_key=ctx.session_key,
+                pending_queue=ctx.pending_queue,
+            )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
         ctx.tools_used = tools_used
@@ -1483,12 +1610,13 @@ class AgentLoop:
         self._clear_pending_user_turn(ctx.session)
         self._clear_runtime_checkpoint(ctx.session)
         self.sessions.save(ctx.session)
-        self._schedule_background(
-            self.consolidator.maybe_consolidate_by_tokens(
-                ctx.session,
-                replay_max_messages=self._max_messages,
+        if not ctx.plain_chat:
+            self._schedule_background(
+                self.consolidator.maybe_consolidate_by_tokens(
+                    ctx.session,
+                    replay_max_messages=self._max_messages,
+                )
             )
-        )
         return "ok"
 
     async def _state_respond(self, ctx: TurnContext) -> str:
