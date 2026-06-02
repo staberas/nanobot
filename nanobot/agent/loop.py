@@ -207,8 +207,6 @@ class AgentLoop:
         runtime_events: RuntimeEventBus | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
         tool_selection: Any | None = None,
-        plain_chat_when_tools_unsupported: bool = False,
-        plain_chat_system_prompt: str | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -246,15 +244,6 @@ class AgentLoop:
             else defaults.tool_hint_max_length
         )
         self.tool_selection = tool_selection
-        self._base_tool_selection = tool_selection
-        self._base_plain_chat_when_tools_unsupported = plain_chat_when_tools_unsupported
-        self._base_plain_chat_system_prompt = (
-            plain_chat_system_prompt
-            or defaults.plain_chat_system_prompt
-        )
-        self.tool_selection = self._base_tool_selection
-        self.plain_chat_when_tools_unsupported = self._base_plain_chat_when_tools_unsupported
-        self.plain_chat_system_prompt = self._base_plain_chat_system_prompt
         self.tools_config = _tc
         self.web_config = _tc.web
         self.exec_config = _tc.exec
@@ -372,16 +361,6 @@ class AgentLoop:
             if tool_selection_config is not None
             else None
         )
-        plain_chat_when_tools_unsupported = (
-            resolved.plain_chat_when_tools_unsupported
-            if resolved.plain_chat_when_tools_unsupported is not None
-            else defaults.plain_chat_when_tools_unsupported
-        )
-        plain_chat_system_prompt = (
-            resolved.plain_chat_system_prompt
-            if resolved.plain_chat_system_prompt is not None
-            else defaults.plain_chat_system_prompt
-        )
         provider_snapshot_loader = extra.pop("provider_snapshot_loader", None)
         preset_snapshot_loader = extra.pop("preset_snapshot_loader", None) or preset_helpers.make_preset_snapshot_loader(
             config,
@@ -396,8 +375,6 @@ class AgentLoop:
             max_concurrent_subagents=defaults.max_concurrent_subagents,
             context_window_tokens=context_window_tokens,
             tool_selection=tool_selection,
-            plain_chat_when_tools_unsupported=plain_chat_when_tools_unsupported,
-            plain_chat_system_prompt=plain_chat_system_prompt,
             context_block_limit=defaults.context_block_limit,
             max_tool_result_chars=defaults.max_tool_result_chars,
             provider_retry_mode=defaults.provider_retry_mode,
@@ -888,8 +865,6 @@ class AgentLoop:
                 goal_active_predicate=lambda: sustained_goal_active(session.metadata) if session is not None else False,
                 goal_continue_message=_goal_continue,
                 tool_selection=self.tool_selection,
-                plain_chat=self._plain_chat_mode_active(),
-                selection_text=current_message,
             ))
         finally:
             reset_workspace_scope(workspace_token)

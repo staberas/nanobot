@@ -67,8 +67,7 @@ def _message_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def tool_schema_name(schema: dict[str, Any]) -> str:
-    """Return the tool name from an OpenAI or Responses-style tool schema."""
+def _schema_name(schema: dict[str, Any]) -> str:
     fn = schema.get("function")
     if isinstance(fn, dict) and isinstance(fn.get("name"), str):
         return fn["name"]
@@ -115,14 +114,12 @@ def select_tool_definitions(
     session_key: str | None = None,
     context_window_tokens: int | None = None,
     estimate_tokens: int | None = None,
-    prompt_override: str | None = None,
-    log_selection: bool = True,
 ) -> list[dict[str, Any]]:
     """Filter tool schemas according to runtime tool-selection settings."""
     if config is None or not config.enabled:
         return definitions
 
-    by_name = {tool_schema_name(schema): schema for schema in definitions if tool_schema_name(schema)}
+    by_name = {_schema_name(schema): schema for schema in definitions if _schema_name(schema)}
     available = set(by_name)
     deny = set(config.deny)
     allow = set(config.allow)
@@ -137,7 +134,7 @@ def select_tool_definitions(
         if name in by_name and permitted(name) and name not in selected_names:
             selected_names.append(name)
 
-    prompt = prompt_override if prompt_override is not None else _message_text(messages)
+    prompt = _message_text(messages)
     dynamic_candidates = heuristic_tool_names(prompt, available)
     dynamic_count = 0
     max_dynamic = max(0, config.max_tools)
@@ -150,32 +147,12 @@ def select_tool_definitions(
         dynamic_count += 1
 
     selected = [by_name[name] for name in selected_names]
-    if log_selection:
-        log_tool_selection(
-            selected,
-            registered_count=len(definitions),
-            session_key=session_key,
-            context_window_tokens=context_window_tokens,
-            estimate_tokens=estimate_tokens,
-        )
-    return selected
-
-
-def log_tool_selection(
-    selected: list[dict[str, Any]],
-    *,
-    registered_count: int,
-    session_key: str | None = None,
-    context_window_tokens: int | None = None,
-    estimate_tokens: int | None = None,
-) -> None:
-    """Log selected tool names and the prompt estimate for the actual outgoing set."""
-    selected_names = [name for schema in selected if (name := tool_schema_name(schema))]
     logger.info(
         "Selected tools for session {}: {} from {} registered tools; estimated prompt tokens {}/{}",
         session_key or "default",
         selected_names,
-        registered_count,
+        len(definitions),
         estimate_tokens if estimate_tokens is not None else "?",
         context_window_tokens if context_window_tokens is not None else "?",
     )
+    return selected

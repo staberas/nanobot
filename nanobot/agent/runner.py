@@ -13,11 +13,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.agent.tool_selection import (
-    ToolSelectionConfig,
-    log_tool_selection,
-    select_tool_definitions,
-)
+from nanobot.agent.tool_selection import ToolSelectionConfig, select_tool_definitions
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -114,8 +110,6 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
     tool_selection: ToolSelectionConfig | None = None
-    plain_chat: bool = False
-    selection_text: str | None = None
 
 
 @dataclass(slots=True)
@@ -708,24 +702,16 @@ class AgentRunner:
             timeout_s = None
 
         all_tools = spec.tools.get_definitions()
-        selected_tools = select_tool_definitions(
-            all_tools,
-            messages,
-            spec.tool_selection,
-            session_key=spec.session_key,
-            context_window_tokens=spec.context_window_tokens,
-            prompt_override=spec.selection_text,
-            log_selection=False,
-        )
         estimate, _ = estimate_prompt_tokens_chain(
             self.provider,
             spec.model,
             messages,
-            selected_tools,
+            all_tools,
         )
-        log_tool_selection(
-            selected_tools,
-            registered_count=len(all_tools),
+        selected_tools = select_tool_definitions(
+            all_tools,
+            messages,
+            spec.tool_selection,
             session_key=spec.session_key,
             context_window_tokens=spec.context_window_tokens,
             estimate_tokens=estimate,
@@ -1349,8 +1335,6 @@ class AgentRunner:
             spec.tool_selection,
             session_key=spec.session_key,
             context_window_tokens=spec.context_window_tokens,
-            prompt_override=spec.selection_text,
-            log_selection=False,
         )
 
     def _snip_history(

@@ -90,39 +90,3 @@ def test_multiple_custom_providers_and_presets_resolve_independently() -> None:
     provider = make_provider(config)
     assert provider.get_default_model() == "Qwen3-4B-w8a8-npu"
     assert provider._capabilities.tools is False
-
-
-def test_plain_chat_capability_request_uses_max_tokens_without_tool_fields() -> None:
-    provider = OpenAICompatProvider(
-        spec=find_by_name("volcengine"),
-        capabilities=ProviderCapabilitiesConfig(
-            tools=False,
-            toolChoice=False,
-            parallelToolCalls=False,
-            responseFormat=False,
-            maxCompletionTokens=False,
-            preferMaxTokens=True,
-        ),
-        extra_body={"parallel_tool_calls": True, "response_format": {"type": "json_object"}},
-    )
-
-    kwargs = provider._build_kwargs(
-        [
-            {"role": "system", "content": "You are concise."},
-            {"role": "user", "content": "say exactly ok"},
-        ],
-        [_tool()],
-        model="ep-test",
-        max_tokens=32,
-        temperature=0.2,
-        reasoning_effort=None,
-        tool_choice="auto",
-    )
-
-    assert kwargs["max_tokens"] == 32
-    assert "max_completion_tokens" not in kwargs
-    assert "tools" not in kwargs
-    assert "tool_choice" not in kwargs
-    assert "parallel_tool_calls" not in kwargs
-    assert "response_format" not in kwargs
-    assert "extra_body" not in kwargs

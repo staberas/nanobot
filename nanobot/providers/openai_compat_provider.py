@@ -620,10 +620,6 @@ class OpenAICompatProvider(LLMProvider):
             return caps.get(name)
         return getattr(caps, name, None)
 
-    @property
-    def supports_tools(self) -> bool:
-        return self._tools_supported()
-
     def _tools_supported(self) -> bool:
         return self._capability("tools") is not False
 
@@ -634,17 +630,15 @@ class OpenAICompatProvider(LLMProvider):
         return bool(self._capability("prefer_max_tokens")) or self._capability("max_completion_tokens") is False
 
     def _filter_capability_body(self, body: dict[str, Any]) -> dict[str, Any]:
-        extra_body = body.get("extra_body")
         if self._capability("parallel_tool_calls") is False:
             body.pop("parallel_tool_calls", None)
-            if isinstance(extra_body, dict):
-                extra_body.pop("parallel_tool_calls", None)
         if self._capability("response_format") is False:
             body.pop("response_format", None)
+            extra_body = body.get("extra_body")
             if isinstance(extra_body, dict):
                 extra_body.pop("response_format", None)
-        if isinstance(extra_body, dict) and not extra_body:
-            body.pop("extra_body", None)
+                if not extra_body:
+                    body.pop("extra_body", None)
         if not self._tools_supported():
             if body.pop("tools", None) is not None:
                 logger.info("Provider capability tools=false; omitting OpenAI tool schemas")
