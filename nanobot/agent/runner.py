@@ -13,6 +13,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext
+from nanobot.agent.tool_selection import ToolSelectionConfig, select_tool_definitions
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.utils.file_edit_events import (
@@ -108,6 +109,7 @@ class AgentRunSpec:
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
+    tool_selection: ToolSelectionConfig | None = None
 
 
 @dataclass(slots=True)
@@ -646,10 +648,25 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        all_tools = spec.tools.get_definitions()
+        estimate, _ = estimate_prompt_tokens_chain(
+            self.provider,
+            spec.model,
+            messages,
+            all_tools,
+        )
+        selected_tools = select_tool_definitions(
+            all_tools,
+            messages,
+            spec.tool_selection,
+            session_key=spec.session_key,
+            context_window_tokens=spec.context_window_tokens,
+            estimate_tokens=estimate,
+        )
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=selected_tools,
         )
         wants_streaming = hook.wants_streaming()
         wants_progress_streaming = (
@@ -1252,6 +1269,21 @@ class AgentRunner:
                 updated[idx]["content"] = normalized
         return updated
 
+
+    def _selected_tool_definitions_for_budget(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        definitions = spec.tools.get_definitions()
+        return select_tool_definitions(
+            definitions,
+            messages,
+            spec.tool_selection,
+            session_key=spec.session_key,
+            context_window_tokens=spec.context_window_tokens,
+        )
+
     def _snip_history(
         self,
         spec: AgentRunSpec,
@@ -1274,7 +1306,7 @@ class AgentRunner:
             self.provider,
             spec.model,
             messages,
-            spec.tools.get_definitions(),
+            self._selected_tool_definitions_for_budget(spec, messages),
         )
         if estimate <= budget:
             return messages
@@ -1289,7 +1321,7 @@ class AgentRunner:
             self.provider,
             spec.model,
             system_messages,
-            spec.tools.get_definitions(),
+            self._selected_tool_definitions_for_budget(spec, system_messages),
         )
         remaining_budget = max(0, budget - max(system_tokens, fixed_tokens))
         kept: list[dict[str, Any]] = []
