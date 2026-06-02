@@ -714,10 +714,10 @@ class AgentRunner:
             all_tools,
             messages,
             spec.tool_selection,
-            prompt_override=spec.selection_text,
             session_key=spec.session_key,
             context_window_tokens=spec.context_window_tokens,
             estimate_tokens=estimate,
+            prompt_override=spec.selection_text,
         )
         kwargs = self._build_request_kwargs(
             spec,

@@ -245,6 +245,7 @@ class AgentLoop:
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
         )
+        self.tool_selection = tool_selection
         self._base_tool_selection = tool_selection
         self._base_plain_chat_when_tools_unsupported = plain_chat_when_tools_unsupported
         self._base_plain_chat_system_prompt = (
