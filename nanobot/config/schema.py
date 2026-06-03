@@ -91,6 +91,20 @@ class InlineFallbackConfig(Base):
 FallbackCandidate = str | InlineFallbackConfig
 
 
+class ContextPipelineConfig(Base):
+    """Context-economy middleware settings for plain-chat tool execution."""
+
+    enabled: bool = True
+    max_planner_tokens: int = Field(default=64, ge=16, le=512)
+    max_reducer_tokens: int = Field(default=96, ge=16, le=512)
+    max_final_evidence_chars: int = Field(default=1600, ge=200, le=8000)
+    max_search_results: int = Field(default=5, ge=1, le=10)
+    max_relevant_results: int = Field(default=3, ge=1, le=10)
+    enable_web_fetch: bool = False
+    fetch_max_chars: int = Field(default=3000, ge=500, le=20000)
+    debug: bool = False
+
+
 class ToolSelectionConfig(Base):
     """Config-driven model-visible tool selection policy."""
 
@@ -129,8 +143,9 @@ class ModelPresetConfig(Base):
     tool_selection: ToolSelectionConfig | None = None
     plain_chat_when_tools_unsupported: bool = False
     plain_chat_system_prompt: str = "You are a concise assistant. Reply in plain text only."
-    tool_execution_mode: Literal["tool_calls", "prompt_injection"] = "tool_calls"
+    tool_execution_mode: Literal["tool_calls", "prompt_injection", "context_pipeline"] = "tool_calls"
     tool_result_injection_max_chars: int = Field(default=1200, ge=200, le=8000)
+    context_pipeline: ContextPipelineConfig = Field(default_factory=ContextPipelineConfig)
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -169,8 +184,9 @@ class AgentDefaults(Base):
     reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
     plain_chat_when_tools_unsupported: bool = False
     plain_chat_system_prompt: str = "You are a concise assistant. Reply in plain text only."
-    tool_execution_mode: Literal["tool_calls", "prompt_injection"] = "tool_calls"
+    tool_execution_mode: Literal["tool_calls", "prompt_injection", "context_pipeline"] = "tool_calls"
     tool_result_injection_max_chars: int = Field(default=1200, ge=200, le=8000)
+    context_pipeline: ContextPipelineConfig = Field(default_factory=ContextPipelineConfig)
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
     bot_icon: str = ""  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
@@ -443,6 +459,7 @@ class Config(BaseSettings):
             plain_chat_system_prompt=d.plain_chat_system_prompt,
             tool_execution_mode=d.tool_execution_mode,
             tool_result_injection_max_chars=d.tool_result_injection_max_chars,
+            context_pipeline=d.context_pipeline,
         )
 
     def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:

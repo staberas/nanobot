@@ -25,7 +25,7 @@ from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
-from nanobot.agent.tool_selection import select_tools_for_request
+from nanobot.agent.tool_selection import heuristic_tool_names, select_tools_for_request
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
@@ -118,6 +118,7 @@ class TurnContext:
     had_injections: bool = False
     plain_chat: bool = False
     prompt_injection_tools_used: list[str] = field(default_factory=list)
+    context_pipeline_state: dict[str, Any] = field(default_factory=dict)
 
     user_persisted_early: bool = False
     save_skip: int = 0
@@ -220,6 +221,7 @@ class AgentLoop:
         plain_chat_system_prompt: str | None = None,
         tool_execution_mode: str | None = None,
         tool_result_injection_max_chars: int | None = None,
+        context_pipeline: Any | None = None,
     ):
         from nanobot.config.schema import ToolsConfig
 
@@ -273,6 +275,7 @@ class AgentLoop:
             if tool_result_injection_max_chars is not None
             else defaults.tool_result_injection_max_chars
         )
+        self.context_pipeline = context_pipeline or defaults.context_pipeline
         self.tools_config = _tc
         self.web_config = _tc.web
         self.exec_config = _tc.exec
@@ -424,6 +427,7 @@ class AgentLoop:
                 "tool_result_injection_max_chars",
                 defaults.tool_result_injection_max_chars,
             ),
+            context_pipeline=getattr(resolved, "context_pipeline", defaults.context_pipeline),
             restrict_to_workspace=config.tools.restrict_to_workspace,
             mcp_servers=config.tools.mcp_servers,
             channels_config=config.channels,
@@ -467,6 +471,13 @@ class AgentLoop:
                 if preset_cfg.tool_selection is not None and hasattr(preset_cfg.tool_selection, "to_runtime")
                 else preset_cfg.tool_selection
             )
+            self.tool_execution_mode = getattr(preset_cfg, "tool_execution_mode", self.tool_execution_mode)
+            self.tool_result_injection_max_chars = getattr(
+                preset_cfg,
+                "tool_result_injection_max_chars",
+                self.tool_result_injection_max_chars,
+            )
+            self.context_pipeline = getattr(preset_cfg, "context_pipeline", self.context_pipeline)
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
         self.consolidator.set_provider(provider, model, context_window_tokens)
@@ -863,7 +874,325 @@ class AgentLoop:
             )
         ctx.initial_messages = self._trim_plain_chat_to_context(ctx.initial_messages)
 
-    async def _run_plain_chat(
+    @staticmethod
+    def _parse_json_object(text: str | None) -> dict[str, Any] | None:
+        if not isinstance(text, str) or not text.strip():
+            return None
+        candidates = [text.strip()]
+        if match := re.search(r"\{.*\}", text, flags=re.S):
+            candidates.append(match.group(0))
+        for candidate in candidates:
+            with suppress(Exception):
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+        return None
+
+    async def _plain_provider_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+    ) -> LLMResponse:
+        model_messages = [
+            {key: value for key, value in message.items() if not key.startswith("_")}
+            for message in messages
+        ]
+        kwargs: dict[str, Any] = {
+            "messages": model_messages,
+            "tools": None,
+            "model": self.model,
+            "retry_mode": self.provider_retry_mode,
+            "on_retry_wait": on_retry_wait,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        return await self.provider.chat_with_retry(**kwargs)
+
+    def _context_pipeline_cfg(self, name: str, default: Any) -> Any:
+        return getattr(self.context_pipeline, name, default)
+
+    def _context_pipeline_heuristic_plan(self, request: str) -> dict[str, Any]:
+        names = heuristic_tool_names(request)
+        if "web_search" in names:
+            return {
+                "action": "web_search",
+                "query": self._plain_chat_search_query(request),
+                "reason": "heuristic selected web_search",
+            }
+        return {"action": "answer_directly", "query": "", "reason": "heuristic direct answer"}
+
+    async def _context_pipeline_plan(
+        self,
+        request: str,
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        prompt = (
+            "You are a routing controller. Choose one action.\n\n"
+            "Available actions:\n"
+            "- answer_directly: answer without external tools\n"
+            "- web_search: search the web for current/external information\n"
+            "- ask_clarifying: ask one short clarification question\n\n"
+            f"User request:\n{request}\n\n"
+            "Return JSON only:\n"
+            '{"action":"answer_directly|web_search|ask_clarifying","query":"...","reason":"..."}'
+        )
+        response = await self._plain_provider_chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=int(self._context_pipeline_cfg("max_planner_tokens", 64)),
+            on_retry_wait=on_retry_wait,
+        )
+        parsed = self._parse_json_object(response.content)
+        if not parsed:
+            parsed = self._context_pipeline_heuristic_plan(request)
+        action = str(parsed.get("action") or "answer_directly").strip()
+        if action not in {"answer_directly", "web_search", "ask_clarifying"}:
+            action = self._context_pipeline_heuristic_plan(request)["action"]
+        query = str(parsed.get("query") or "").strip()
+        if action == "web_search" and not query:
+            query = self._plain_chat_search_query(request)
+        plan = {"action": action, "query": query, "reason": str(parsed.get("reason") or "").strip()}
+        logger.info('Context pipeline planner action={} query="{}"', action, query)
+        return plan
+
+    @staticmethod
+    def _parse_web_search_results(result: Any) -> list[dict[str, str]]:
+        if isinstance(result, list):
+            parsed: list[dict[str, str]] = []
+            for item in result:
+                if isinstance(item, dict):
+                    parsed.append({
+                        "title": str(item.get("title") or ""),
+                        "url": str(item.get("url") or ""),
+                        "snippet": str(item.get("content") or item.get("snippet") or ""),
+                    })
+            return parsed
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        rows: list[dict[str, str]] = []
+        current: dict[str, str] | None = None
+        snippet_lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.lower().startswith("results for:"):
+                continue
+            if match := re.match(r"^(\d+)\.\s*(.*)$", line):
+                if current is not None:
+                    current["snippet"] = " ".join(snippet_lines).strip()
+                    rows.append(current)
+                current = {"title": match.group(2).strip(), "url": "", "snippet": ""}
+                snippet_lines = []
+                continue
+            if current is None:
+                continue
+            if not current["url"] and re.match(r"https?://", line, re.I):
+                current["url"] = line
+            else:
+                snippet_lines.append(line)
+        if current is not None:
+            current["snippet"] = " ".join(snippet_lines).strip()
+            rows.append(current)
+        return rows or ([{"title": "Search result", "url": "", "snippet": text[:1000]}] if text.strip() else [])
+
+    @staticmethod
+    def _query_terms(text: str) -> set[str]:
+        return {term.casefold() for term in re.findall(r"[\wÀ-ſ]{3,}", text)}
+
+    def _fallback_reduce_result(
+        self,
+        request: str,
+        query: str,
+        result: dict[str, str],
+    ) -> dict[str, Any] | None:
+        haystack = f"{result.get('title', '')} {result.get('snippet', '')}".casefold()
+        terms = self._query_terms(query) or self._query_terms(request)
+        hits = sum(1 for term in terms if term in haystack)
+        if hits <= 0:
+            return None
+        return {
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "summary": result.get("snippet") or result.get("title", ""),
+            "score": min(3, max(1, hits)),
+        }
+
+    async def _context_pipeline_reduce_result(
+        self,
+        request: str,
+        query: str,
+        result: dict[str, str],
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+    ) -> dict[str, Any] | None:
+        prompt = (
+            f"Original user request:\n{request}\n\n"
+            "Search result:\n"
+            f"Title: {result.get('title', '')}\n"
+            f"URL: {result.get('url', '')}\n"
+            f"Snippet: {result.get('snippet', '')}\n\n"
+            "Is this search result relevant to the request?\n"
+            "Return JSON only:\n"
+            '{"relevant":true|false,"score":0-3,"summary":"one short factual summary","url":"..."}'
+        )
+        response = await self._plain_provider_chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=int(self._context_pipeline_cfg("max_reducer_tokens", 96)),
+            on_retry_wait=on_retry_wait,
+        )
+        parsed = self._parse_json_object(response.content)
+        if not parsed:
+            return self._fallback_reduce_result(request, query, result)
+        if not bool(parsed.get("relevant")):
+            return None
+        try:
+            score = int(parsed.get("score", 1))
+        except (TypeError, ValueError):
+            score = 1
+        return {
+            "title": result.get("title", ""),
+            "url": str(parsed.get("url") or result.get("url", "")),
+            "summary": str(parsed.get("summary") or result.get("snippet") or result.get("title", "")),
+            "score": max(0, min(3, score)),
+        }
+
+    async def _context_pipeline_fetch_reduce(
+        self,
+        request: str,
+        evidence: dict[str, Any],
+        on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+    ) -> dict[str, Any] | None:
+        url = str(evidence.get("url") or "").strip()
+        if not url:
+            return evidence
+        fetch_max = int(self._context_pipeline_cfg("fetch_max_chars", 3000))
+        fetched = await self.tools.execute("web_fetch", {"url": url, "maxChars": fetch_max})
+        page_text = fetched if isinstance(fetched, str) else json.dumps(fetched, ensure_ascii=False)
+        page_text = page_text[:fetch_max]
+        prompt = (
+            f"Original user request:\n{request}\n\n"
+            f"Page text:\n{page_text}\n\n"
+            "Return JSON only:\n"
+            '{"relevant":true|false,"summary":"compact summary","facts":["..."],"url":"..."}'
+        )
+        response = await self._plain_provider_chat(
+            [{"role": "user", "content": prompt}],
+            max_tokens=int(self._context_pipeline_cfg("max_reducer_tokens", 96)),
+            on_retry_wait=on_retry_wait,
+        )
+        parsed = self._parse_json_object(response.content)
+        if not parsed or not bool(parsed.get("relevant")):
+            return evidence
+        summary = str(parsed.get("summary") or evidence.get("summary") or "")
+        facts = parsed.get("facts")
+        if isinstance(facts, list) and facts:
+            fact_text = "; ".join(str(fact) for fact in facts[:3] if str(fact).strip())
+            if fact_text:
+                summary = f"{summary} Facts: {fact_text}" if summary else fact_text
+        updated = dict(evidence)
+        updated["summary"] = summary
+        updated["url"] = str(parsed.get("url") or url)
+        return updated
+
+    def _format_context_pipeline_evidence(self, evidence: list[dict[str, Any]]) -> str:
+        max_chars = int(self._context_pipeline_cfg("max_final_evidence_chars", 1600))
+        lines: list[str] = []
+        for idx, item in enumerate(evidence, 1):
+            title = str(item.get("title") or "Untitled").strip()
+            summary = str(item.get("summary") or "").strip()
+            url = str(item.get("url") or "").strip()
+            line = f"{idx}. {title} — {summary} — {url}".strip()
+            if len("\n".join(lines + [line])) > max_chars:
+                break
+            lines.append(line)
+        text = "\n".join(lines)
+        logger.info("Context pipeline final evidence chars {}/{}", len(text), max_chars)
+        return text
+
+    async def _run_context_pipeline(
+        self,
+        ctx: TurnContext,
+    ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        request = ctx.msg.content.strip()
+        plan = await self._context_pipeline_plan(request, ctx.on_retry_wait)
+        ctx.context_pipeline_state = {"original_request": request, "planner": plan, "evidence": []}
+        action = plan.get("action")
+        if action == "ask_clarifying":
+            final = str(plan.get("query") or "Can you clarify what you want me to look up?").strip()
+            messages = [{"role": "user", "content": request}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+        if action != "web_search":
+            ctx.initial_messages = self._trim_plain_chat_to_context([
+                {"role": "system", "content": self.plain_chat_system_prompt},
+                {"role": "user", "content": request},
+            ])
+            return await self._run_plain_chat_direct(ctx)
+
+        query = str(plan.get("query") or self._plain_chat_search_query(request))
+        count = int(self._context_pipeline_cfg("max_search_results", 5))
+        raw_results = await self.tools.execute("web_search", {"query": query, "count": count})
+        ctx.prompt_injection_tools_used.append("web_search")
+        parsed_results = self._parse_web_search_results(raw_results)
+        logger.info("Context pipeline web_search results={}", len(parsed_results))
+
+        evidence: list[dict[str, Any]] = []
+        for result in parsed_results[:count]:
+            reduced = await self._context_pipeline_reduce_result(request, query, result, ctx.on_retry_wait)
+            if reduced is not None:
+                evidence.append(reduced)
+        evidence.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
+        max_relevant = int(self._context_pipeline_cfg("max_relevant_results", 3))
+        evidence = evidence[:max_relevant]
+        logger.info("Context pipeline reducer kept {}/{}", len(evidence), len(parsed_results[:count]))
+        if bool(self._context_pipeline_cfg("enable_web_fetch", False)) and evidence:
+            fetched_evidence: list[dict[str, Any]] = []
+            for item in evidence:
+                fetched = await self._context_pipeline_fetch_reduce(request, item, ctx.on_retry_wait)
+                if fetched is not None:
+                    fetched_evidence.append(fetched)
+            evidence = fetched_evidence[:max_relevant]
+            if evidence and "web_fetch" not in ctx.prompt_injection_tools_used:
+                ctx.prompt_injection_tools_used.append("web_fetch")
+        ctx.context_pipeline_state["evidence"] = evidence
+
+        evidence_text = self._format_context_pipeline_evidence(evidence)
+        if evidence_text:
+            user_prompt = (
+                f"Original user request:\n{request}\n\n"
+                f"Evidence:\n{evidence_text}\n\n"
+                "Answer the user:"
+            )
+        else:
+            user_prompt = (
+                f"Original user request:\n{request}\n\n"
+                "Evidence:\nNo relevant search results were found.\n\n"
+                "Answer by saying the available search results are insufficient."
+            )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise assistant. Use only the evidence below. "
+                    "If evidence is insufficient, say so. Do not say you cannot search; "
+                    "the search has already been done."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt_tokens, source = estimate_prompt_tokens_chain(self.provider, self.model, messages, None)
+        logger.info(
+            "Context pipeline prompt estimate {}/{} ({})",
+            prompt_tokens,
+            self.context_window_tokens or "?",
+            source,
+        )
+        response = await self._plain_provider_chat(messages, on_retry_wait=ctx.on_retry_wait)
+        self._last_usage = dict(response.usage or {})
+        final = response.content or EMPTY_FINAL_RESPONSE_MESSAGE
+        stop_reason = "error" if response.finish_reason == "error" else "completed"
+        all_messages = list(messages)
+        all_messages.append({"role": "assistant", "content": final})
+        return final, list(ctx.prompt_injection_tools_used), all_messages, stop_reason, False
+
+    async def _run_plain_chat_direct(
         self,
         ctx: TurnContext,
     ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
@@ -893,6 +1222,16 @@ class AgentLoop:
         messages = list(model_messages)
         messages.append({"role": "assistant", "content": final})
         return final, list(ctx.prompt_injection_tools_used), messages, stop_reason, False
+
+    async def _run_plain_chat(
+        self,
+        ctx: TurnContext,
+    ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        if self.tool_execution_mode == "context_pipeline" and bool(
+            self._context_pipeline_cfg("enabled", True)
+        ):
+            return await self._run_context_pipeline(ctx)
+        return await self._run_plain_chat_direct(ctx)
 
     async def _dispatch_command_inline(
         self,
@@ -1685,8 +2024,15 @@ class AgentLoop:
 
         if ctx.plain_chat:
             logger.info("Plain-chat mode active")
-            ctx.initial_messages, ctx.history = self._build_plain_chat_messages(ctx.msg, ctx.session)
-            await self._inject_plain_chat_tool_results(ctx)
+            if self.tool_execution_mode == "context_pipeline":
+                ctx.history = []
+                ctx.initial_messages = [
+                    {"role": "system", "content": self.plain_chat_system_prompt},
+                    {"role": "user", "content": ctx.msg.content},
+                ]
+            else:
+                ctx.initial_messages, ctx.history = self._build_plain_chat_messages(ctx.msg, ctx.session)
+                await self._inject_plain_chat_tool_results(ctx)
             ctx.save_skip = len(ctx.initial_messages)
         else:
             ctx.history = ctx.session.get_history(**_hist_kwargs)
