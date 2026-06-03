@@ -61,7 +61,13 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
         "plainChatSystemPrompt": "plain only",
         "toolExecutionMode": "context_pipeline",
         "toolResultInjectionMaxChars": 1000,
-        "contextPipeline": {"maxPlannerTokens": 48, "maxRelevantResults": 2},
+        "contextPipeline": {
+            "maxPlannerTokens": 48,
+            "maxRelevantResults": 2,
+            "enableCron": True,
+            "defaultReminderTime": "08:30",
+            "timezone": "Europe/Athens",
+        },
     })
 
     assert defaults.plain_chat_when_tools_unsupported is True
@@ -70,6 +76,9 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
     assert defaults.tool_result_injection_max_chars == 1000
     assert defaults.context_pipeline.max_planner_tokens == 48
     assert defaults.context_pipeline.max_relevant_results == 2
+    assert defaults.context_pipeline.enable_cron is True
+    assert defaults.context_pipeline.default_reminder_time == "08:30"
+    assert defaults.context_pipeline.timezone == "Europe/Athens"
 
 
 def test_plain_chat_bypasses_tool_loop_when_provider_lacks_tools(tmp_path) -> None:
@@ -478,6 +487,9 @@ def test_context_pipeline_cron_reminder_creates_job(tmp_path) -> None:
             tool_selection=AgentDefaults.model_validate({
                 "toolSelection": {"enabled": True, "mode": "heuristic", "maxTools": 1, "allow": ["cron"]}
             }).tool_selection,
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"enableCron": True, "timezone": "Europe/Athens"}
+            }).context_pipeline,
         )
 
         result = await loop._process_message(
@@ -485,12 +497,12 @@ def test_context_pipeline_cron_reminder_creates_job(tmp_path) -> None:
                 channel="matrix",
                 sender_id="@u:s",
                 chat_id="!room:s",
-                content="remind me tomorrow at 9 to check the cluster",
+                content="remind me in 2 min to check the cluster",
             )
         )
 
         assert result is not None
-        assert "Reminder scheduled" in result.content
+        assert "Reminder set for" in result.content
         jobs = cron_service.list_jobs(include_disabled=True)
         assert len(jobs) == 1
         job = jobs[0]
@@ -501,6 +513,8 @@ def test_context_pipeline_cron_reminder_creates_job(tmp_path) -> None:
         assert job.delete_after_run is True
         assert job.schedule.kind == "at"
         assert job.state.next_run_at_ms is not None
+        assert job.payload.channel_meta["created_by"] == "@u:s"
+        assert job.payload.channel_meta["reminder_text"] == "check the cluster"
     asyncio.run(run())
 
 
@@ -525,6 +539,9 @@ def test_context_pipeline_cron_denied_does_not_claim_success(tmp_path) -> None:
             tool_selection=AgentDefaults.model_validate({
                 "toolSelection": {"enabled": True, "mode": "heuristic", "maxTools": 1, "deny": ["cron"]}
             }).tool_selection,
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"enableCron": True}
+            }).context_pipeline,
         )
 
         result = await loop._process_message(
@@ -563,6 +580,9 @@ def test_context_pipeline_cron_ambiguous_time_asks_clarification(tmp_path) -> No
             tool_selection=AgentDefaults.model_validate({
                 "toolSelection": {"enabled": True, "mode": "heuristic", "maxTools": 1, "allow": ["cron"]}
             }).tool_selection,
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"enableCron": True, "timezone": "Europe/Athens"}
+            }).context_pipeline,
         )
 
         result = await loop._process_message(
@@ -601,6 +621,9 @@ def test_context_pipeline_cron_timezone_is_respected(tmp_path) -> None:
             tool_selection=AgentDefaults.model_validate({
                 "toolSelection": {"enabled": True, "mode": "heuristic", "maxTools": 1, "allow": ["cron"]}
             }).tool_selection,
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"enableCron": True, "timezone": "Europe/Athens"}
+            }).context_pipeline,
         )
 
         result = await loop._process_message(
@@ -620,4 +643,133 @@ def test_context_pipeline_cron_timezone_is_respected(tmp_path) -> None:
         assert jobs[0].schedule.tz == "America/Denver"
         assert jobs[0].payload.message == "check the cluster"
         assert jobs[0].payload.to == "!room:s"
+    asyncio.run(run())
+
+
+def test_context_pipeline_cron_tomorrow_at_nine_creates_one_shot(tmp_path) -> None:
+    async def run() -> None:
+        cron_service = CronService(tmp_path / "cron" / "jobs.json")
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"cron","query":"check the cluster","reason":"reminder"}'],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            cron_service=cron_service,
+            timezone="UTC",
+            tool_selection=AgentDefaults.model_validate({
+                "toolSelection": {"enabled": True, "mode": "heuristic", "maxTools": 1, "allow": ["cron"]}
+            }).tool_selection,
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"enableCron": True, "timezone": "Europe/Athens"}
+            }).context_pipeline,
+        )
+
+        result = await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="!room:s",
+                content="remind me tomorrow at 9 to check the cluster",
+            )
+        )
+
+        assert result is not None
+        assert "Reminder set for" in result.content
+        job = cron_service.list_jobs(include_disabled=True)[0]
+        assert job.schedule.kind == "at"
+        assert job.delete_after_run is True
+        assert job.payload.message == "check the cluster"
+    asyncio.run(run())
+
+
+def test_context_pipeline_cron_enable_false_does_not_schedule(tmp_path) -> None:
+    async def run() -> None:
+        cron_service = CronService(tmp_path / "cron" / "jobs.json")
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"cron","query":"check the cluster","reason":"reminder"}'],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            cron_service=cron_service,
+            timezone="UTC",
+            tool_selection=AgentDefaults.model_validate({
+                "toolSelection": {"enabled": True, "mode": "heuristic", "maxTools": 1, "allow": ["cron"]}
+            }).tool_selection,
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"enableCron": False}
+            }).context_pipeline,
+        )
+
+        result = await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="!room:s",
+                content="remind me in 2 min to check the cluster",
+            )
+        )
+
+        assert result is not None
+        assert result.content == "I cannot schedule reminders yet."
+        assert cron_service.list_jobs(include_disabled=True) == []
+    asyncio.run(run())
+
+
+def test_context_pipeline_cron_every_morning_uses_default_time(tmp_path) -> None:
+    async def run() -> None:
+        cron_service = CronService(tmp_path / "cron" / "jobs.json")
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"cron","query":"check the cluster","reason":"reminder"}'],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            cron_service=cron_service,
+            timezone="UTC",
+            tool_selection=AgentDefaults.model_validate({
+                "toolSelection": {"enabled": True, "mode": "heuristic", "maxTools": 1, "allow": ["cron"]}
+            }).tool_selection,
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"enableCron": True, "defaultReminderTime": "09:00", "timezone": "Europe/Athens"}
+            }).context_pipeline,
+        )
+
+        result = await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="!room:s",
+                content="every morning remind me to check the cluster",
+            )
+        )
+
+        assert result is not None
+        job = cron_service.list_jobs(include_disabled=True)[0]
+        assert job.schedule.kind == "cron"
+        assert job.schedule.expr == "0 9 * * *"
+        assert job.schedule.tz == "Europe/Athens"
+        assert job.payload.message == "check the cluster"
     asyncio.run(run())

@@ -43,6 +43,7 @@ from nanobot.bus.runtime_events import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.cron.types import CronSchedule
 from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.factory import ProviderSnapshot
 from nanobot.security.workspace_access import (
@@ -963,11 +964,21 @@ class AgentLoop:
         return {"action": "answer_directly", "query": "", "reason": "heuristic direct answer"}
 
     def _context_pipeline_default_timezone(self) -> str:
-        tz = str(getattr(self.context, "timezone", None) or "UTC")
+        configured = self._context_pipeline_cfg("timezone", None)
+        tz = str(configured or getattr(self.context, "timezone", None) or "UTC")
         with suppress(Exception):
             ZoneInfo(tz)
             return tz
         return "UTC"
+
+    def _context_pipeline_default_reminder_time(self) -> tuple[int, int]:
+        raw = str(self._context_pipeline_cfg("default_reminder_time", "09:00") or "09:00")
+        if match := re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*$", raw):
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour, minute
+        return 9, 0
 
     @staticmethod
     def _extract_context_pipeline_timezone(request: str, default: str) -> str:
@@ -1017,18 +1028,30 @@ class AgentLoop:
         tz = self._extract_context_pipeline_timezone(request, default_tz)
         reminder_text = self._extract_context_pipeline_reminder_text(request)
         lower = request.casefold()
+        base = datetime.now(ZoneInfo(tz))
+
+        if match := re.search(r"\bin\s+(\d+)\s*(min|mins|minute|minutes|h|hr|hrs|hour|hours)\b", request, flags=re.I):
+            amount = int(match.group(1))
+            unit = match.group(2).casefold()
+            delta = timedelta(hours=amount) if unit in {"h", "hr", "hrs", "hour", "hours"} else timedelta(minutes=amount)
+            target = base + delta
+            return {"reminder_text": reminder_text, "timezone": tz, "at": target.isoformat()}
 
         hour, minute, _ = self._parse_context_pipeline_time(request)
+        if re.search(r"\b(every\s+morning)\b", request, flags=re.I):
+            hour, minute = self._context_pipeline_default_reminder_time()
+            return {"reminder_text": reminder_text, "timezone": tz, "cron_expr": f"{minute} {hour} * * *"}
+        if re.search(r"\b(every\s+evening)\b", request, flags=re.I):
+            return {"reminder_text": reminder_text, "timezone": tz, "cron_expr": "0 18 * * *"}
         if re.search(r"\b(every\s+day|daily)\b", request, flags=re.I):
             if hour is None:
-                return {"reminder_text": reminder_text, "timezone": tz, "needs_clarification": True}
+                hour, minute = self._context_pipeline_default_reminder_time()
             return {
                 "reminder_text": reminder_text,
                 "timezone": tz,
                 "cron_expr": f"{minute} {hour} * * *",
             }
 
-        base = datetime.now(ZoneInfo(tz))
         target_date = None
         if "tomorrow" in lower:
             target_date = (base + timedelta(days=1)).date()
@@ -1038,8 +1061,10 @@ class AgentLoop:
             with suppress(ValueError):
                 target_date = datetime.fromisoformat(match.group(1)).date()
 
-        if target_date is None or hour is None:
+        if target_date is None:
             return {"reminder_text": reminder_text, "timezone": tz, "needs_clarification": True}
+        if hour is None:
+            hour, minute = self._context_pipeline_default_reminder_time()
 
         target = datetime(
             target_date.year,
@@ -1264,12 +1289,24 @@ class AgentLoop:
         ctx: TurnContext,
         plan: dict[str, Any],
     ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        if not bool(self._context_pipeline_cfg("enable_cron", False)):
+            logger.info("Context pipeline cron disabled")
+            final = "I cannot schedule reminders yet."
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
         if not self._context_pipeline_tool_allowed("cron"):
+            logger.info("Context pipeline cron disabled")
+            final = "I cannot schedule reminders yet."
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+        if self.cron_service is None:
+            logger.info("Context pipeline cron disabled")
             final = "I cannot schedule reminders yet."
             messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
             return final, [], messages, "completed", False
 
         if bool(plan.get("needs_clarification")):
+            logger.info("Context pipeline cron parse failed")
             final = "When should I remind you?"
             messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
             return final, [], messages, "completed", False
@@ -1279,43 +1316,60 @@ class AgentLoop:
         cron_expr = str(plan.get("cron_expr") or "").strip()
         timezone = str(plan.get("timezone") or self._context_pipeline_default_timezone()).strip()
         if not reminder_text or (not at and not cron_expr):
+            logger.info("Context pipeline cron parse failed")
             final = "When should I remind you?"
             messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
             return final, [], messages, "completed", False
 
-        params: dict[str, Any] = {
-            "action": "add",
-            "message": reminder_text,
-            "name": f"Reminder: {reminder_text[:40]}",
-            "deliver": True,
-        }
-        schedule_label = at
-        if cron_expr:
-            params["cron_expr"] = cron_expr
-            params["tz"] = timezone
-            schedule_label = f"{cron_expr} ({timezone})"
-        else:
-            params["at"] = at
-        logger.info("Context pipeline cron parsed schedule={}", schedule_label)
-        result = await self.tools.execute("cron", params)
-        if not isinstance(result, str) or result.startswith("Error:") or "Created job" not in result:
-            final = "I cannot schedule reminders yet."
-            if isinstance(result, str) and result.startswith("Error:"):
-                logger.info("Context pipeline cron failed: {}", result)
+        try:
+            if cron_expr:
+                schedule = CronSchedule(kind="cron", expr=cron_expr, tz=timezone)
+                schedule_label = f"{cron_expr} ({timezone})"
+                delete_after = False
+            else:
+                target = datetime.fromisoformat(at)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=ZoneInfo(timezone))
+                schedule = CronSchedule(kind="at", at_ms=int(target.timestamp() * 1000))
+                schedule_label = target.isoformat()
+                delete_after = True
+        except Exception:
+            logger.info("Context pipeline cron parse failed")
+            final = "I could not schedule that reminder."
             messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
             return final, [], messages, "completed", False
 
-        job_id = ""
-        if match := re.search(r"id:\s*([^\)]+)", result):
-            job_id = match.group(1).strip()
-        logger.info("Context pipeline cron job created id={}", job_id or "?")
-        final = f"Reminder scheduled: {reminder_text}"
-        if schedule_label:
-            final += f" ({schedule_label})"
-        if job_id:
-            final += f". Job id: {job_id}"
-        else:
-            final += "."
+        logger.info('Context pipeline cron parsed schedule={} reminder="{}"', schedule_label, reminder_text)
+        channel_meta = dict(ctx.msg.metadata or {})
+        channel_meta.update({
+            "created_by": ctx.msg.sender_id,
+            "sender_id": ctx.msg.sender_id,
+            "created_at": int(time.time() * 1000),
+            "original_request": ctx.msg.content,
+            "reminder_text": reminder_text,
+            "schedule": schedule_label,
+            "_context_pipeline_reminder": True,
+        })
+        try:
+            job = self.cron_service.add_job(
+                name=f"Reminder: {reminder_text[:40]}",
+                schedule=schedule,
+                message=reminder_text,
+                deliver=True,
+                channel=ctx.msg.channel,
+                to=ctx.msg.chat_id,
+                delete_after_run=delete_after,
+                channel_meta=channel_meta,
+                session_key=ctx.session_key,
+            )
+        except Exception:
+            logger.exception("Context pipeline cron job creation failed")
+            final = "I could not schedule that reminder."
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+
+        logger.info("Context pipeline cron job created id={}", job.id)
+        final = f"Reminder set for {schedule_label}: {reminder_text}"
         ctx.prompt_injection_tools_used.append("cron")
         messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
         return final, list(ctx.prompt_injection_tools_used), messages, "completed", False

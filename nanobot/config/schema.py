@@ -102,6 +102,9 @@ class ContextPipelineConfig(Base):
     max_relevant_results: int = Field(default=3, ge=1, le=10)
     enable_web_fetch: bool = False
     fetch_max_chars: int = Field(default=3000, ge=500, le=20000)
+    enable_cron: bool = False
+    default_reminder_time: str = "09:00"
+    timezone: str | None = None
     debug: bool = False
 
 

@@ -1101,6 +1101,9 @@ without chat history, skills, or tool schemas:
         "maxRelevantResults": 3,
         "enableWebFetch": false,
         "fetchMaxChars": 3000,
+        "enableCron": true,
+        "defaultReminderTime": "09:00",
+        "timezone": "Europe/Athens",
         "debug": false
       },
       "toolSelection": {
@@ -1125,18 +1128,22 @@ without chat history, skills, or tool schemas:
 | `maxRelevantResults` | `3` | Top reduced evidence items kept for the final prompt. |
 | `enableWebFetch` | `false` | Fetch and summarize top result pages. Leave off for very small models unless needed. |
 | `fetchMaxChars` | `3000` | Maximum page text passed to the fetch reducer. |
+| `enableCron` | `false` | Enable deterministic reminder scheduling through CronService when `cron` is also allowed by `toolSelection`. |
+| `defaultReminderTime` | `"09:00"` | Default HH:MM used for phrases such as `every morning` or date-only reminders. |
+| `timezone` | `null` | Optional IANA timezone for context-pipeline reminders, for example `Europe/Athens`; falls back to the agent timezone or UTC. |
 | `debug` | `false` | Reserved for additional pipeline diagnostics. |
 
 Configure web search under [`tools.web.search`](#toolswebsearch). The pipeline does not
 persist raw search results or fetched page text into session history; it saves only the
 normal user-visible turn.
 
-For reminders, also allow `cron` in `toolSelection` and run nanobot with cron enabled.
-When the planner classifies a request such as `remind me tomorrow at 9 to check the
-cluster` as `cron`, nanobot parses the schedule, creates the job through the existing
-CronService/CronTool path, and confirms only after the job is registered. If `cron` is not
-allowed, unavailable, or the time is ambiguous, the bot refuses safely or asks for the
-missing time instead of claiming that a reminder was set.
+For reminders, set `contextPipeline.enableCron: true`, allow `cron` in `toolSelection`,
+and run nanobot with cron enabled. When the planner classifies a request such as
+`remind me in 2 min to check the cluster` or `remind me tomorrow at 9 to check the
+cluster` as `cron`, nanobot parses the schedule deterministically, creates the job through
+the existing CronService job store, and confirms only after the job is registered. If cron
+is disabled, denied, unavailable, or the time is ambiguous, the bot refuses safely or asks
+for the missing time instead of claiming that a reminder was set.
 
 ### Model Fallbacks
 
