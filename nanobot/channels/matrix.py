@@ -3,6 +3,7 @@
 import asyncio
 import json
 import mimetypes
+import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -205,9 +206,17 @@ class MatrixConfig(Base):
     max_media_bytes: int = 20 * 1024 * 1024
     max_concurrent_media_downloads: int = 2
     allow_from: list[str] = Field(default_factory=list)
-    group_policy: Literal["open", "mention", "allowlist"] = "open"
+    group_policy: Literal["open", "mention", "mentions", "allowlist"] = "open"
     group_allow_from: list[str] = Field(default_factory=list)
     allow_room_mentions: bool = False
+    respond_in_dm: bool = True
+    respond_when_mentioned: bool = True
+    respond_to_display_name: bool = True
+    respond_to_user_id: bool = True
+    respond_to_aliases: list[str] = Field(default_factory=list)
+    respond_to_prefixes: list[str] = Field(default_factory=list)
+    ignore_messages_mentioning_others_only: bool = True
+    allow_reply_followups: bool = False
     streaming: bool = False
 
 
@@ -733,18 +742,197 @@ class MatrixChannel(BaseChannel):
         count = getattr(room, "member_count", None)
         return isinstance(count, int) and count <= 2
 
-    def _is_bot_mentioned(self, event: RoomMessage) -> bool:
-        """Check m.mentions payload for bot mention."""
+    @staticmethod
+    def _matrix_localpart(user_id: str) -> str:
+        if not user_id.startswith("@"):
+            return user_id
+        return user_id[1:].split(":", 1)[0]
+
+    @staticmethod
+    def _normalize_attention_token(value: str) -> str:
+        return re.sub(r"\s+", " ", value.casefold()).strip()
+
+    @staticmethod
+    def _strip_matrix_reply_fallback(text: str) -> str:
+        """Remove Matrix rich-reply fallback quote text from a message body."""
+        lines = text.splitlines()
+        idx = 0
+        while idx < len(lines) and (lines[idx].startswith(">") or not lines[idx].strip()):
+            idx += 1
+        return "\n".join(lines[idx:]).strip() if idx else text.strip()
+
+    @staticmethod
+    def _strip_leading_attention_token(text: str, token: str) -> str | None:
+        token = token.strip()
+        if not token:
+            return None
+        pattern = re.compile(
+            rf"^\s*{re.escape(token)}(?:\s+|[\s:：,，;；.!?\-–—]+|$)",
+            re.IGNORECASE,
+        )
+        match = pattern.match(text)
+        if not match:
+            return None
+        return text[match.end():].lstrip()
+
+    def _event_mentions(self, event: RoomMessage) -> dict[str, Any]:
         source = getattr(event, "source", None)
         if not isinstance(source, dict):
-            return False
+            return {}
         mentions = (source.get("content") or {}).get("m.mentions")
-        if not isinstance(mentions, dict):
-            return False
+        return mentions if isinstance(mentions, dict) else {}
+
+    def _mentioned_user_ids(self, event: RoomMessage) -> list[str]:
+        user_ids = self._event_mentions(event).get("user_ids")
+        return [uid for uid in user_ids if isinstance(uid, str)] if isinstance(user_ids, list) else []
+
+    def _is_bot_mentioned(self, event: RoomMessage) -> bool:
+        """Check m.mentions payload for bot mention."""
+        mentions = self._event_mentions(event)
         user_ids = mentions.get("user_ids")
         if isinstance(user_ids, list) and self.config.user_id in user_ids:
             return True
         return bool(self.config.allow_room_mentions and mentions.get("room") is True)
+
+    def _bot_display_names(self, room: MatrixRoom) -> list[str]:
+        names: list[str] = []
+        user_id = str(self.config.user_id or "")
+        if user_id:
+            names.append(self._matrix_localpart(user_id))
+        for candidate in (
+            getattr(getattr(room, "own_user", None), "display_name", None),
+            getattr(getattr(room, "own_user", None), "displayname", None),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                names.append(candidate.strip())
+        for mapping_name in ("users", "members"):
+            mapping = getattr(room, mapping_name, None)
+            member = mapping.get(user_id) if isinstance(mapping, dict) else None
+            for attr in ("display_name", "displayname", "name"):
+                candidate = getattr(member, attr, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    names.append(candidate.strip())
+        member_getter = getattr(room, "member", None)
+        if callable(member_getter):
+            with suppress(Exception):
+                member = member_getter(user_id)
+                for attr in ("display_name", "displayname", "name"):
+                    candidate = getattr(member, attr, None)
+                    if isinstance(candidate, str) and candidate.strip():
+                        names.append(candidate.strip())
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            key = self._normalize_attention_token(name)
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(name)
+        return deduped
+
+    def _attention_tokens(self, room: MatrixRoom) -> list[tuple[str, str]]:
+        tokens: list[tuple[str, str]] = []
+        if self.config.respond_to_user_id and self.config.user_id:
+            tokens.append((self.config.user_id, "bot mention"))
+        if self.config.respond_to_display_name:
+            tokens.extend((name, "display name") for name in self._bot_display_names(room))
+        tokens.extend((alias, "alias") for alias in self.config.respond_to_aliases if alias.strip())
+        deduped: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for token, reason in tokens:
+            key = self._normalize_attention_token(token)
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append((token, reason))
+        deduped.sort(key=lambda item: len(item[0]), reverse=True)
+        return deduped
+
+    def _strip_prefix_attention(self, text: str) -> tuple[str | None, str | None]:
+        leading = text.lstrip()
+        for prefix in self.config.respond_to_prefixes:
+            prefix = prefix.strip()
+            if not prefix:
+                continue
+            if leading.casefold().startswith(prefix.casefold()):
+                return leading[len(prefix):].lstrip(), "prefix"
+        return None, None
+
+    def _strip_token_attention(self, room: MatrixRoom, text: str) -> tuple[str | None, str | None]:
+        for token, reason in self._attention_tokens(room):
+            stripped = self._strip_leading_attention_token(text, token)
+            if stripped is not None:
+                return stripped, reason
+        return None, None
+
+    @staticmethod
+    def _is_command_text(text: str) -> bool:
+        return text.lstrip().startswith("/")
+
+    def _is_reply_event(self, event: RoomMessage) -> bool:
+        relates_to = self._event_source_content(event).get("m.relates_to")
+        return isinstance(relates_to, dict) and isinstance(relates_to.get("m.in_reply_to"), dict)
+
+    def _matrix_attention_decision(
+        self,
+        room: MatrixRoom,
+        event: RoomMessage,
+        text: str,
+    ) -> tuple[bool, str, str]:
+        """Return (accepted, cleaned_text, reason) for Matrix attention gating."""
+        cleaned = self._strip_matrix_reply_fallback(text)
+        is_dm = self._is_direct_room(room)
+        if is_dm:
+            if self.config.respond_in_dm:
+                self.logger.info("Matrix: accepted DM message")
+                return True, cleaned, "dm"
+            self.logger.info("Matrix: ignored DM message; respondInDm disabled")
+            return False, cleaned, "dm_disabled"
+
+        if self._is_command_text(cleaned):
+            self.logger.info("Matrix: accepted group message via command")
+            return True, cleaned, "command"
+
+        policy = self.config.group_policy
+        if policy == "open":
+            return True, cleaned, "open"
+        if policy == "allowlist":
+            allowed = room.room_id in (self.config.group_allow_from or [])
+            if not allowed:
+                self.logger.info("Matrix: ignored group message; room not in groupAllowFrom")
+            return allowed, cleaned, "allowlist"
+        if policy not in {"mention", "mentions"}:
+            return False, cleaned, "unknown_policy"
+
+        mentioned_user_ids = self._mentioned_user_ids(event)
+        bot_mentioned = self._is_bot_mentioned(event)
+        if (
+            self.config.ignore_messages_mentioning_others_only
+            and mentioned_user_ids
+            and not bot_mentioned
+        ):
+            self.logger.info("Matrix: ignored group message; bot not addressed")
+            return False, cleaned, "mentions_other"
+
+        stripped, reason = self._strip_prefix_attention(cleaned)
+        if stripped is not None:
+            self.logger.info("Matrix: accepted group message via prefix")
+            return True, stripped, "prefix"
+
+        stripped, reason = self._strip_token_attention(room, cleaned)
+        if stripped is not None:
+            log_reason = "prefix" if reason == "alias" else "bot mention"
+            self.logger.info("Matrix: accepted group message via {}", log_reason)
+            return True, stripped, reason or "mention"
+
+        if (
+            self.config.respond_when_mentioned
+            and bot_mentioned
+            and (self.config.allow_reply_followups or not self._is_reply_event(event))
+        ):
+            self.logger.info("Matrix: accepted group message via bot mention")
+            return True, cleaned, "bot mention"
+
+        self.logger.info("Matrix: ignored group message; bot not addressed")
+        return False, cleaned, "not_addressed"
 
     def _is_pre_startup_event(self, event: RoomMessage) -> bool:
         """Skip events that landed in the timeline before this process started.
@@ -757,19 +945,17 @@ class MatrixChannel(BaseChannel):
         return isinstance(ts, int) and ts < self._started_at_ms
 
     def _should_process_message(self, room: MatrixRoom, event: RoomMessage) -> bool:
-        """Apply sender and room policy checks."""
+        """Apply sender and room policy checks for non-text/media callers."""
         if not self.is_allowed(event.sender):
+            self.logger.info("Matrix: ignored sender not in allowFrom")
             return False
-        if self._is_direct_room(room):
-            return True
-        policy = self.config.group_policy
-        if policy == "open":
-            return True
-        if policy == "allowlist":
-            return room.room_id in (self.config.group_allow_from or [])
-        if policy == "mention":
-            return self._is_bot_mentioned(event)
-        return False
+        body = getattr(event, "body", "")
+        accepted, _, _ = self._matrix_attention_decision(
+            room,
+            event,
+            body if isinstance(body, str) else "",
+        )
+        return accepted
 
     def _media_dir(self) -> Path:
         return get_media_dir("matrix")
@@ -966,17 +1152,19 @@ class MatrixChannel(BaseChannel):
         return meta
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
-        if (
-            event.sender == self.config.user_id
-            or self._is_pre_startup_event(event)
-            or not self._should_process_message(room, event)
-        ):
+        if event.sender == self.config.user_id or self._is_pre_startup_event(event):
+            return
+        if not self.is_allowed(event.sender):
+            self.logger.info("Matrix: ignored sender not in allowFrom")
+            return
+        accepted, content, _reason = self._matrix_attention_decision(room, event, event.body)
+        if not accepted:
             return
         await self._start_typing_keepalive(room.room_id)
         try:
             await self._handle_message(
                 sender_id=event.sender, chat_id=room.room_id,
-                content=event.body, metadata=self._base_metadata(room, event),
+                content=content, metadata=self._base_metadata(room, event),
                 is_dm=self._is_direct_room(room),
             )
         except Exception:
@@ -984,16 +1172,23 @@ class MatrixChannel(BaseChannel):
             raise
 
     async def _on_media_message(self, room: MatrixRoom, event: MatrixMediaEvent) -> None:
-        if (
-            event.sender == self.config.user_id
-            or self._is_pre_startup_event(event)
-            or not self._should_process_message(room, event)
-        ):
+        if event.sender == self.config.user_id or self._is_pre_startup_event(event):
+            return
+        if not self.is_allowed(event.sender):
+            self.logger.info("Matrix: ignored sender not in allowFrom")
+            return
+        body = getattr(event, "body", "")
+        accepted, cleaned_body, _reason = self._matrix_attention_decision(
+            room,
+            event,
+            body if isinstance(body, str) else "",
+        )
+        if not accepted:
             return
         attachment, marker = await self._fetch_media_attachment(room, event)
         parts: list[str] = []
-        if isinstance(body := getattr(event, "body", None), str) and body.strip():
-            parts.append(body.strip())
+        if cleaned_body.strip():
+            parts.append(cleaned_body.strip())
 
         if attachment and attachment.get("type") == "audio":
             transcription = await self.transcribe_audio(attachment["path"])

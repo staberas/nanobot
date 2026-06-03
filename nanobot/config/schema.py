@@ -91,6 +91,23 @@ class InlineFallbackConfig(Base):
 FallbackCandidate = str | InlineFallbackConfig
 
 
+class ContextPipelineConfig(Base):
+    """Context-economy middleware settings for plain-chat tool execution."""
+
+    enabled: bool = True
+    max_planner_tokens: int = Field(default=64, ge=16, le=512)
+    max_reducer_tokens: int = Field(default=96, ge=16, le=512)
+    max_final_evidence_chars: int = Field(default=1600, ge=200, le=8000)
+    max_search_results: int = Field(default=5, ge=1, le=10)
+    max_relevant_results: int = Field(default=3, ge=1, le=10)
+    enable_web_fetch: bool = False
+    fetch_max_chars: int = Field(default=3000, ge=500, le=20000)
+    enable_cron: bool = False
+    default_reminder_time: str = "09:00"
+    timezone: str | None = None
+    debug: bool = False
+
+
 class ToolSelectionConfig(Base):
     """Config-driven model-visible tool selection policy."""
 
@@ -110,6 +127,11 @@ class ToolSelectionConfig(Base):
                 raise ValueError(f"toolSelection.{field_name} entries must be non-empty strings")
         return self
 
+    def to_runtime(self) -> Any:
+        from nanobot.agent.tool_selection import ToolSelectionPolicy
+
+        return ToolSelectionPolicy.from_config(self)
+
 
 class ModelPresetConfig(Base):
     """A named set of model + generation parameters for quick switching."""
@@ -122,6 +144,11 @@ class ModelPresetConfig(Base):
     temperature: float = 0.1
     reasoning_effort: str | None = None
     tool_selection: ToolSelectionConfig | None = None
+    plain_chat_when_tools_unsupported: bool = False
+    plain_chat_system_prompt: str = "You are a concise assistant. Reply in plain text only."
+    tool_execution_mode: Literal["tool_calls", "prompt_injection", "context_pipeline"] = "tool_calls"
+    tool_result_injection_max_chars: int = Field(default=1200, ge=200, le=8000)
+    context_pipeline: ContextPipelineConfig = Field(default_factory=ContextPipelineConfig)
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -158,9 +185,14 @@ class AgentDefaults(Base):
         serialization_alias="toolHintMaxLength",
     )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
     reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
+    plain_chat_when_tools_unsupported: bool = False
+    plain_chat_system_prompt: str = "You are a concise assistant. Reply in plain text only."
+    tool_execution_mode: Literal["tool_calls", "prompt_injection", "context_pipeline"] = "tool_calls"
+    tool_result_injection_max_chars: int = Field(default=1200, ge=200, le=8000)
+    context_pipeline: ContextPipelineConfig = Field(default_factory=ContextPipelineConfig)
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
-    bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
+    bot_icon: str = ""  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     session_ttl_minutes: int = Field(
@@ -426,6 +458,11 @@ class Config(BaseSettings):
             context_window_tokens=d.context_window_tokens,
             temperature=d.temperature, reasoning_effort=d.reasoning_effort,
             tool_selection=d.tool_selection,
+            plain_chat_when_tools_unsupported=d.plain_chat_when_tools_unsupported,
+            plain_chat_system_prompt=d.plain_chat_system_prompt,
+            tool_execution_mode=d.tool_execution_mode,
+            tool_result_injection_max_chars=d.tool_result_injection_max_chars,
+            context_pipeline=d.context_pipeline,
         )
 
     def resolve_preset(self, name: str | None = None) -> ModelPresetConfig:
