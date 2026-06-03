@@ -741,6 +741,178 @@ async def test_on_message_mention_policy_requires_mx_mentions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_message_mentions_policy_ignores_other_user_mentions() -> None:
+    channel = MatrixChannel(_make_config(group_policy="mentions"), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    handled: list[str] = []
+
+    async def _fake_handle_message(**kwargs) -> None:
+        handled.append(kwargs["content"])
+
+    channel._handle_message = _fake_handle_message  # type: ignore[method-assign]
+
+    room = SimpleNamespace(room_id="!room:matrix.org", display_name="Test room", member_count=3)
+    event = SimpleNamespace(
+        sender="@alice:matrix.org",
+        body="@jason:matrix.org can you check this?",
+        source={"content": {"m.mentions": {"user_ids": ["@jason:matrix.org"]}}},
+    )
+
+    await channel._on_message(room, event)
+
+    assert handled == []
+    assert client.typing_calls == []
+
+
+@pytest.mark.asyncio
+async def test_on_message_mentions_policy_strips_bot_user_id() -> None:
+    channel = MatrixChannel(_make_config(group_policy="mentions"), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    handled: list[str] = []
+
+    async def _fake_handle_message(**kwargs) -> None:
+        handled.append(kwargs["content"])
+
+    channel._handle_message = _fake_handle_message  # type: ignore[method-assign]
+
+    room = SimpleNamespace(room_id="!room:matrix.org", display_name="Test room", member_count=3)
+    event = SimpleNamespace(
+        sender="@alice:matrix.org",
+        body="@bot:matrix.org search Jason Kolios",
+        source={"content": {"m.mentions": {"user_ids": ["@bot:matrix.org"]}}},
+    )
+
+    await channel._on_message(room, event)
+
+    assert handled == ["search Jason Kolios"]
+    assert client.typing_calls == [("!room:matrix.org", True, TYPING_NOTICE_TIMEOUT_MS)]
+
+
+@pytest.mark.asyncio
+async def test_on_message_mentions_policy_accepts_display_name_alias_and_prefix() -> None:
+    channel = MatrixChannel(
+        _make_config(
+            group_policy="mentions",
+            respond_to_aliases=["hermes", "bot"],
+            respond_to_prefixes=["hermes:", "bot,"],
+        ),
+        MessageBus(),
+    )
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    handled: list[str] = []
+
+    async def _fake_handle_message(**kwargs) -> None:
+        handled.append(kwargs["content"])
+
+    channel._handle_message = _fake_handle_message  # type: ignore[method-assign]
+
+    room = SimpleNamespace(room_id="!room:matrix.org", display_name="Test room", member_count=3)
+    await channel._on_message(
+        room,
+        SimpleNamespace(sender="@alice:matrix.org", body="hermes search Jason", source={"content": {}}),
+    )
+    await channel._on_message(
+        room,
+        SimpleNamespace(sender="@alice:matrix.org", body="hermes: llo", source={"content": {}}),
+    )
+    await channel._on_message(
+        room,
+        SimpleNamespace(sender="@alice:matrix.org", body="bot, search Greece", source={"content": {}}),
+    )
+
+    assert handled == ["search Jason", "llo", "search Greece"]
+
+
+@pytest.mark.asyncio
+async def test_on_message_mentions_policy_accepts_commands_but_not_reply_chatter() -> None:
+    channel = MatrixChannel(_make_config(group_policy="mentions"), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    handled: list[str] = []
+
+    async def _fake_handle_message(**kwargs) -> None:
+        handled.append(kwargs["content"])
+
+    channel._handle_message = _fake_handle_message  # type: ignore[method-assign]
+
+    room = SimpleNamespace(room_id="!room:matrix.org", display_name="Test room", member_count=3)
+    await channel._on_message(
+        room,
+        SimpleNamespace(sender="@alice:matrix.org", body="/new", source={"content": {}}),
+    )
+    await channel._on_message(
+        room,
+        SimpleNamespace(
+            sender="@alice:matrix.org",
+            body="> <@bot:matrix.org> previous\n\nthanks",
+            source={
+                "content": {
+                    "m.mentions": {"user_ids": ["@bot:matrix.org"]},
+                    "m.relates_to": {"m.in_reply_to": {"event_id": "$old"}},
+                }
+            },
+        ),
+    )
+
+    assert handled == ["/new"]
+
+
+@pytest.mark.asyncio
+async def test_on_message_dm_allowed_and_disallowed_senders() -> None:
+    channel = MatrixChannel(_make_config(allow_from=["@alice:matrix.org"], group_policy="mentions"), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    handled: list[str] = []
+
+    async def _fake_handle_message(**kwargs) -> None:
+        handled.append(kwargs["content"])
+
+    channel._handle_message = _fake_handle_message  # type: ignore[method-assign]
+
+    room = SimpleNamespace(room_id="!dm:matrix.org", display_name="DM", member_count=2)
+    await channel._on_message(
+        room,
+        SimpleNamespace(sender="@alice:matrix.org", body="hello", source={"content": {}}),
+    )
+    await channel._on_message(
+        room,
+        SimpleNamespace(sender="@mallory:matrix.org", body="hello", source={"content": {}}),
+    )
+
+    assert handled == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_on_message_open_policy_preserves_group_chatter() -> None:
+    channel = MatrixChannel(_make_config(group_policy="open"), MessageBus())
+    client = _FakeAsyncClient("", "", "", None)
+    channel.client = client
+
+    handled: list[str] = []
+
+    async def _fake_handle_message(**kwargs) -> None:
+        handled.append(kwargs["content"])
+
+    channel._handle_message = _fake_handle_message  # type: ignore[method-assign]
+
+    room = SimpleNamespace(room_id="!room:matrix.org", display_name="Test room", member_count=3)
+    await channel._on_message(
+        room,
+        SimpleNamespace(sender="@alice:matrix.org", body="search Jason Kolios", source={"content": {}}),
+    )
+
+    assert handled == ["search Jason Kolios"]
+
+
+@pytest.mark.asyncio
 async def test_on_message_mention_policy_accepts_bot_user_mentions() -> None:
     channel = MatrixChannel(_make_config(group_policy="mention"), MessageBus())
     client = _FakeAsyncClient("", "", "", None)
