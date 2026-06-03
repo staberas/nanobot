@@ -1041,7 +1041,7 @@ with no OpenAI tool schema fields.
 |------|----------|----------|
 | `tool_calls` | Normal agent loop with model-visible tool schemas and tool-call iterations. | Tool-capable hosted models and local servers with working tool parsing. |
 | `prompt_injection` | Heuristic tool selection runs selected lightweight tools internally, currently `web_search`, trims the result, injects compact text into one plain-chat prompt, then calls the provider once. | Small models that need basic search without function calling. |
-| `context_pipeline` | Uses tiny no-history planner prompts, executes search internally, asks reducer prompts to keep compact evidence, then sends one final no-history evidence prompt. | Context-constrained local models where history, tool schemas, and raw pages would overflow the context window. |
+| `context_pipeline` | Uses tiny no-history planner prompts, executes allowed tools internally, asks reducer prompts to keep compact evidence for search, then sends one final no-history evidence prompt. Cron/reminder requests are scheduled directly through Nanobot's cron service when `cron` is explicitly allowed. | Context-constrained local models where history, tool schemas, and raw pages would overflow the context window. |
 
 #### Prompt-injected search
 
@@ -1107,7 +1107,7 @@ without chat history, skills, or tool schemas:
         "enabled": true,
         "mode": "heuristic",
         "maxTools": 1,
-        "allow": ["web_search", "web_fetch"],
+        "allow": ["web_search", "web_fetch", "cron"],
         "deny": ["apply_patch", "run_cli_app", "edit_file", "read_file", "write_file"]
       }
     }
@@ -1130,6 +1130,13 @@ without chat history, skills, or tool schemas:
 Configure web search under [`tools.web.search`](#toolswebsearch). The pipeline does not
 persist raw search results or fetched page text into session history; it saves only the
 normal user-visible turn.
+
+For reminders, also allow `cron` in `toolSelection` and run nanobot with cron enabled.
+When the planner classifies a request such as `remind me tomorrow at 9 to check the
+cluster` as `cron`, nanobot parses the schedule, creates the job through the existing
+CronService/CronTool path, and confirms only after the job is registered. If `cron` is not
+allowed, unavailable, or the time is ambiguous, the bot refuses safely or asks for the
+missing time instead of claiming that a reminder was set.
 
 ### Model Fallbacks
 

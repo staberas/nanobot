@@ -10,9 +10,11 @@ import re
 import time
 from contextlib import AsyncExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -913,7 +915,44 @@ class AgentLoop:
     def _context_pipeline_cfg(self, name: str, default: Any) -> Any:
         return getattr(self.context_pipeline, name, default)
 
+    @staticmethod
+    def _looks_like_reminder_request(request: str) -> bool:
+        return bool(re.search(
+            r"\b(remind\s+me|reminder|schedule|set\s+(?:a\s+)?reminder|wake\s+me|notify\s+me)\b",
+            request or "",
+            flags=re.I,
+        ))
+
+    def _context_pipeline_tool_allowed(self, name: str) -> bool:
+        if name not in self.tools.tool_names:
+            return False
+        policy = self.tool_selection
+        if not bool(getattr(policy, "enabled", False)):
+            return False
+        deny = {str(item) for item in getattr(policy, "deny", []) or []}
+        always = {str(item) for item in getattr(policy, "always_include", []) or []}
+        allow = {str(item) for item in getattr(policy, "allow", []) or []}
+        if name in deny:
+            return False
+        if name in always:
+            return True
+        if allow and name not in allow:
+            return False
+        try:
+            max_tools = int(getattr(policy, "max_tools", 0) or 0)
+        except (TypeError, ValueError):
+            max_tools = 0
+        return max_tools > 0
+
     def _context_pipeline_heuristic_plan(self, request: str) -> dict[str, Any]:
+        if self._looks_like_reminder_request(request):
+            parsed = self._parse_context_pipeline_cron_request(request)
+            return {
+                "action": "cron",
+                "query": parsed.get("reminder_text") or self._plain_chat_search_query(request),
+                "reason": "heuristic selected cron",
+                **parsed,
+            }
         names = heuristic_tool_names(request)
         if "web_search" in names:
             return {
@@ -922,6 +961,97 @@ class AgentLoop:
                 "reason": "heuristic selected web_search",
             }
         return {"action": "answer_directly", "query": "", "reason": "heuristic direct answer"}
+
+    def _context_pipeline_default_timezone(self) -> str:
+        tz = str(getattr(self.context, "timezone", None) or "UTC")
+        with suppress(Exception):
+            ZoneInfo(tz)
+            return tz
+        return "UTC"
+
+    @staticmethod
+    def _extract_context_pipeline_timezone(request: str, default: str) -> str:
+        matches = re.findall(r"\b(?:in|tz|timezone)\s+([A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?)", request)
+        for candidate in reversed(matches):
+            with suppress(Exception):
+                ZoneInfo(candidate)
+                return candidate
+        return default
+
+    @staticmethod
+    def _parse_context_pipeline_time(text: str) -> tuple[int | None, int, bool]:
+        pattern = re.compile(r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", flags=re.I)
+        for match in pattern.finditer(text):
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0)
+            meridiem = (match.group(3) or "").casefold()
+            explicit = bool(match.group(0).strip().lower().startswith("at") or meridiem)
+            if meridiem == "pm" and hour < 12:
+                hour += 12
+            elif meridiem == "am" and hour == 12:
+                hour = 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour, minute, explicit
+        return None, 0, False
+
+    def _extract_context_pipeline_reminder_text(self, request: str) -> str:
+        text = re.sub(r"\s+", " ", request).strip()
+        if match := re.search(r"\bto\s+(.+)$", text, flags=re.I):
+            reminder = match.group(1).strip()
+        else:
+            reminder = re.sub(
+                r"^\s*(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder|schedule\s+(?:a\s+)?reminder|notify\s+me)\s*",
+                "",
+                text,
+                flags=re.I,
+            )
+            reminder = re.sub(r"\b(?:today|tomorrow|tonight)\b", "", reminder, flags=re.I)
+            reminder = re.sub(r"\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", "", reminder, flags=re.I)
+            reminder = re.sub(r"\b(?:in|tz|timezone)\s+[A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?", "", reminder)
+        reminder = re.sub(r"\b(?:in|tz|timezone)\s+[A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?", "", reminder)
+        reminder = re.sub(r"^[,;:\s]+|[,;:\s]+$", "", reminder)
+        return reminder or text
+
+    def _parse_context_pipeline_cron_request(self, request: str) -> dict[str, Any]:
+        default_tz = self._context_pipeline_default_timezone()
+        tz = self._extract_context_pipeline_timezone(request, default_tz)
+        reminder_text = self._extract_context_pipeline_reminder_text(request)
+        lower = request.casefold()
+
+        hour, minute, _ = self._parse_context_pipeline_time(request)
+        if re.search(r"\b(every\s+day|daily)\b", request, flags=re.I):
+            if hour is None:
+                return {"reminder_text": reminder_text, "timezone": tz, "needs_clarification": True}
+            return {
+                "reminder_text": reminder_text,
+                "timezone": tz,
+                "cron_expr": f"{minute} {hour} * * *",
+            }
+
+        base = datetime.now(ZoneInfo(tz))
+        target_date = None
+        if "tomorrow" in lower:
+            target_date = (base + timedelta(days=1)).date()
+        elif "today" in lower or "tonight" in lower:
+            target_date = base.date()
+        elif match := re.search(r"\b(\d{4}-\d{2}-\d{2})\b", request):
+            with suppress(ValueError):
+                target_date = datetime.fromisoformat(match.group(1)).date()
+
+        if target_date is None or hour is None:
+            return {"reminder_text": reminder_text, "timezone": tz, "needs_clarification": True}
+
+        target = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            hour,
+            minute,
+            tzinfo=ZoneInfo(tz),
+        )
+        if target <= base:
+            target = target + timedelta(days=1)
+        return {"reminder_text": reminder_text, "timezone": tz, "at": target.isoformat()}
 
     async def _context_pipeline_plan(
         self,
@@ -933,10 +1063,13 @@ class AgentLoop:
             "Available actions:\n"
             "- answer_directly: answer without external tools\n"
             "- web_search: search the web for current/external information\n"
+            "- cron: schedule a reminder or recurring task\n"
             "- ask_clarifying: ask one short clarification question\n\n"
+            "For cron, include reminder_text plus at (ISO datetime) or cron_expr and timezone. "
+            "Never claim a reminder was scheduled via answer_directly.\n\n"
             f"User request:\n{request}\n\n"
             "Return JSON only:\n"
-            '{"action":"answer_directly|web_search|ask_clarifying","query":"...","reason":"..."}'
+            '{"action":"answer_directly|web_search|cron|ask_clarifying","query":"...","reminder_text":"...","at":"...","cron_expr":"...","timezone":"...","reason":"..."}'
         )
         response = await self._plain_provider_chat(
             [{"role": "user", "content": prompt}],
@@ -946,13 +1079,32 @@ class AgentLoop:
         parsed = self._parse_json_object(response.content)
         if not parsed:
             parsed = self._context_pipeline_heuristic_plan(request)
+        if self._looks_like_reminder_request(request):
+            heuristic = self._context_pipeline_heuristic_plan(request)
+            parsed = {**heuristic, **parsed, "action": "cron"}
         action = str(parsed.get("action") or "answer_directly").strip()
-        if action not in {"answer_directly", "web_search", "ask_clarifying"}:
+        if action == "schedule_reminder":
+            action = "cron"
+        if action not in {"answer_directly", "web_search", "cron", "ask_clarifying"}:
             action = self._context_pipeline_heuristic_plan(request)["action"]
         query = str(parsed.get("query") or "").strip()
         if action == "web_search" and not query:
             query = self._plain_chat_search_query(request)
-        plan = {"action": action, "query": query, "reason": str(parsed.get("reason") or "").strip()}
+        if action == "cron":
+            fallback = self._parse_context_pipeline_cron_request(request)
+            for key, value in fallback.items():
+                if not parsed.get(key):
+                    parsed[key] = value
+            if not query:
+                query = str(parsed.get("reminder_text") or "").strip()
+        plan = {
+            "action": action,
+            "query": query,
+            "reason": str(parsed.get("reason") or "").strip(),
+        }
+        for key in ("reminder_text", "at", "cron_expr", "timezone", "needs_clarification"):
+            if key in parsed and parsed.get(key) not in (None, ""):
+                plan[key] = parsed.get(key)
         logger.info('Context pipeline planner action={} query="{}"', action, query)
         return plan
 
@@ -1107,6 +1259,67 @@ class AgentLoop:
         logger.info("Context pipeline final evidence chars {}/{}", len(text), max_chars)
         return text
 
+    async def _run_context_pipeline_cron(
+        self,
+        ctx: TurnContext,
+        plan: dict[str, Any],
+    ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        if not self._context_pipeline_tool_allowed("cron"):
+            final = "I cannot schedule reminders yet."
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+
+        if bool(plan.get("needs_clarification")):
+            final = "When should I remind you?"
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+
+        reminder_text = str(plan.get("reminder_text") or plan.get("query") or "").strip()
+        at = str(plan.get("at") or "").strip()
+        cron_expr = str(plan.get("cron_expr") or "").strip()
+        timezone = str(plan.get("timezone") or self._context_pipeline_default_timezone()).strip()
+        if not reminder_text or (not at and not cron_expr):
+            final = "When should I remind you?"
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+
+        params: dict[str, Any] = {
+            "action": "add",
+            "message": reminder_text,
+            "name": f"Reminder: {reminder_text[:40]}",
+            "deliver": True,
+        }
+        schedule_label = at
+        if cron_expr:
+            params["cron_expr"] = cron_expr
+            params["tz"] = timezone
+            schedule_label = f"{cron_expr} ({timezone})"
+        else:
+            params["at"] = at
+        logger.info("Context pipeline cron parsed schedule={}", schedule_label)
+        result = await self.tools.execute("cron", params)
+        if not isinstance(result, str) or result.startswith("Error:") or "Created job" not in result:
+            final = "I cannot schedule reminders yet."
+            if isinstance(result, str) and result.startswith("Error:"):
+                logger.info("Context pipeline cron failed: {}", result)
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+
+        job_id = ""
+        if match := re.search(r"id:\s*([^\)]+)", result):
+            job_id = match.group(1).strip()
+        logger.info("Context pipeline cron job created id={}", job_id or "?")
+        final = f"Reminder scheduled: {reminder_text}"
+        if schedule_label:
+            final += f" ({schedule_label})"
+        if job_id:
+            final += f". Job id: {job_id}"
+        else:
+            final += "."
+        ctx.prompt_injection_tools_used.append("cron")
+        messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+        return final, list(ctx.prompt_injection_tools_used), messages, "completed", False
+
     async def _run_context_pipeline(
         self,
         ctx: TurnContext,
@@ -1119,6 +1332,8 @@ class AgentLoop:
             final = str(plan.get("query") or "Can you clarify what you want me to look up?").strip()
             messages = [{"role": "user", "content": request}, {"role": "assistant", "content": final}]
             return final, [], messages, "completed", False
+        if action == "cron":
+            return await self._run_context_pipeline_cron(ctx, plan)
         if action != "web_search":
             ctx.initial_messages = self._trim_plain_chat_to_context([
                 {"role": "system", "content": self.plain_chat_system_prompt},
