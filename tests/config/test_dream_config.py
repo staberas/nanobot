@@ -46,3 +46,20 @@ def test_dream_config_uses_model_override_name_and_accepts_legacy_model() -> Non
     assert cfg.model_override == "openrouter/sonnet"
     assert dumped["modelOverride"] == "openrouter/sonnet"
     assert "model" not in dumped
+
+
+def test_dream_config_accepts_toolless_fallback_flags() -> None:
+    cfg = DreamConfig.model_validate({
+        "toolsRequired": False,
+        "skipWhenToolsUnsupported": True,
+        "plainChatFallback": False,
+    })
+
+    dumped = cfg.model_dump(by_alias=True)
+
+    assert cfg.tools_required is False
+    assert cfg.skip_when_tools_unsupported is True
+    assert cfg.plain_chat_fallback is False
+    assert dumped["toolsRequired"] is False
+    assert dumped["skipWhenToolsUnsupported"] is True
+    assert dumped["plainChatFallback"] is False

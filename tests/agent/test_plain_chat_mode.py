@@ -773,3 +773,36 @@ def test_context_pipeline_cron_every_morning_uses_default_time(tmp_path) -> None
         assert job.schedule.tz == "Europe/Athens"
         assert job.payload.message == "check the cluster"
     asyncio.run(run())
+
+
+def test_plain_chat_text_only_guard_rejects_media_without_llm(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(supports_tools=False, responses=["should not be used"])
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        image_path = tmp_path / "image.png"
+        image_path.write_bytes(b"not really an image")
+        result = await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="!room:s",
+                content="what is in this image?",
+                media=[str(image_path)],
+            )
+        )
+
+        assert result is not None
+        assert "I can only process text in this mode" in result.content
+        assert provider.calls == []
+    asyncio.run(run())

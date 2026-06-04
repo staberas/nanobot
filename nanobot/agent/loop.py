@@ -357,6 +357,13 @@ class AgentLoop:
             store=self.context.memory,
             provider=provider,
             model=self.model,
+            max_batch_size=defaults.dream.max_batch_size,
+            max_iterations=defaults.dream.max_iterations,
+            max_tool_result_chars=self.max_tool_result_chars,
+            annotate_line_ages=defaults.dream.annotate_line_ages,
+            tools_required=defaults.dream.tools_required,
+            skip_when_tools_unsupported=defaults.dream.skip_when_tools_unsupported,
+            plain_chat_fallback=defaults.dream.plain_chat_fallback,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
@@ -1496,6 +1503,14 @@ class AgentLoop:
         self,
         ctx: TurnContext,
     ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        if ctx.msg.media:
+            logger.info("Plain-chat text-only guard: rejected {} attachment(s)", len(ctx.msg.media))
+            final = (
+                "I can only process text in this mode. Please describe the image or attachment "
+                "in text, or switch to a provider that supports the required media/tool workflow."
+            )
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
         if self.tool_execution_mode == "context_pipeline" and bool(
             self._context_pipeline_cfg("enabled", True)
         ):

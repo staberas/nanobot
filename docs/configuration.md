@@ -989,6 +989,7 @@ Existing configs do not need to change. If you do not set `modelPresets` or `age
 | `toolExecutionMode` | Tool execution strategy: `tool_calls` (default), `prompt_injection`, or `context_pipeline`. |
 | `toolResultInjectionMaxChars` | Character budget for injected tool results in `prompt_injection` mode. |
 | `contextPipeline` | Planner/reducer settings for `context_pipeline` mode. |
+| `dream` | Dream memory consolidation settings, including toolless-provider fallback controls. |
 
 `default` is reserved and always means the implicit preset built from `agents.defaults.*`; do not define `modelPresets.default`. Use `/model default` to switch back to `agents.defaults.*`.
 
@@ -1106,6 +1107,12 @@ without chat history, skills, or tool schemas:
         "timezone": "Europe/Athens",
         "debug": false
       },
+      "dream": {
+        "enabled": true,
+        "toolsRequired": false,
+        "skipWhenToolsUnsupported": false,
+        "plainChatFallback": true
+      },
       "toolSelection": {
         "enabled": true,
         "mode": "heuristic",
@@ -1144,6 +1151,15 @@ cluster` as `cron`, nanobot parses the schedule deterministically, creates the j
 the existing CronService job store, and confirms only after the job is registered. If cron
 is disabled, denied, unavailable, or the time is ambiguous, the bot refuses safely or asks
 for the missing time instead of claiming that a reminder was set.
+
+Dream remains enabled by default. For providers with `capabilities.tools=false`, set
+`agents.defaults.dream.plainChatFallback: true` so Dream performs no-tool memory
+summarization instead of requesting `read_file`, `edit_file`, or `write_file`. If you prefer
+Dream to do nothing on toolless providers, set `plainChatFallback: false` or
+`skipWhenToolsUnsupported: true`; it will log that Dream was skipped instead of attempting
+tool workflows. Plain-chat/context-pipeline providers are also text-only for attachments: if
+an image or other unextracted attachment remains on the message, nanobot refuses that turn
+rather than silently sending unsupported media to a text-only model.
 
 ### Model Fallbacks
 
