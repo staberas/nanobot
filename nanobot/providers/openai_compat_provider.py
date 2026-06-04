@@ -376,6 +376,10 @@ class OpenAICompatProvider(LLMProvider):
     def supports_configured_tool_calls(self) -> bool:
         return self._capability("tools", True)
 
+    def supports_tools(self) -> bool:
+        """Honor provider capability overrides when routing turns."""
+        return self.supports_configured_tool_calls
+
     def _build_client(self) -> None:
         """Create the OpenAI client using the current module-level AsyncOpenAI."""
         import httpx

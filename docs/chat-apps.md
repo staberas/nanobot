@@ -247,9 +247,17 @@ for reliable encryption, password login is recommended instead. If the
       "e2eeEnabled": true,
       "sasVerification": true,
       "allowFrom": ["@your_user:matrix.org"],
-      "groupPolicy": "open",
+      "groupPolicy": "mentions",
       "groupAllowFrom": [],
       "allowRoomMentions": false,
+      "respondInDm": true,
+      "respondWhenMentioned": true,
+      "respondToDisplayName": true,
+      "respondToUserId": true,
+      "respondToAliases": ["nanobot", "bot"],
+      "respondToPrefixes": ["nanobot:", "nanobot,", "bot:", "bot,"],
+      "ignoreMessagesMentioningOthersOnly": true,
+      "allowReplyFollowups": false,
       "maxMediaBytes": 20971520
     }
   }
@@ -261,12 +269,28 @@ for reliable encryption, password login is recommended instead. If the
 | Option | Description |
 |--------|-------------|
 | `allowFrom` | User IDs allowed to interact. Empty denies all; use `["*"]` to allow everyone. |
-| `groupPolicy` | `open` (default), `mention`, or `allowlist`. |
+| `groupPolicy` | `open` (default), `mention`/`mentions`, or `allowlist`. Use `mentions` in busy group rooms so the bot responds only when addressed. |
 | `groupAllowFrom` | Room allowlist (used when policy is `allowlist`). |
 | `allowRoomMentions` | Accept `@room` mentions in mention mode. |
+| `respondInDm` | Respond normally in direct-message rooms from allowed users (default `true`). |
+| `respondWhenMentioned` | In mention mode, accept Matrix mentions that target the bot (default `true`). |
+| `respondToDisplayName` | Treat the bot's Matrix display name as an attention token (default `true`). |
+| `respondToUserId` | Treat the bot Matrix user ID, for example `@nanobot:matrix.org`, as an attention token (default `true`). |
+| `respondToAliases` | Extra names that can address the bot, for example `["hermes", "nanobot", "bot"]`. |
+| `respondToPrefixes` | Leading prefixes that address and are stripped before the text reaches the model, for example `["hermes:", "hermes,", "bot:", "bot,"]`. |
+| `ignoreMessagesMentioningOthersOnly` | In mention mode, ignore messages that mention other Matrix users but not the bot (default `true`). |
+| `allowReplyFollowups` | Allow Matrix replies to trigger the bot without fresh addressing (default `false`). Keep this off in noisy rooms. |
 | `e2eeEnabled` | E2EE support (default `true`). Set `false` for plaintext-only. |
 | `sasVerification` | Auto-complete SAS device verification requests from allowed users (default `false`). Useful for Element X, which does not expose manual trust for third-party devices. |
 | `maxMediaBytes` | Max attachment size (default `20MB`). Set `0` to block all media. |
+
+When `groupPolicy` is `mention` or `mentions`, group messages are ignored unless they
+address the bot by Matrix user ID, display name, alias, configured prefix, or a recognized
+slash command such as `/new`. Addressing text is removed before the message is sent to the
+agent, so `nanobot: search Jason Kolios` becomes `search Jason Kolios` in the LLM prompt.
+Messages like `@someone_else:matrix.org can you check this?` and ordinary group chatter do
+not trigger the bot. `allowFrom` still applies first, so mentioning the bot does not grant
+access to users who are not allowed.
 
 
 
