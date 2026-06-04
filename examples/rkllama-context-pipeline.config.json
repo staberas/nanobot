@@ -1,0 +1,71 @@
+{
+  "agents": {
+    "defaults": {
+      "provider": "rkllama",
+      "model": "Qwen3-4B-w8a8-npu",
+      "contextWindowTokens": 2048,
+      "maxTokens": 160,
+      "maxToolIterations": 0,
+      "plainChatWhenToolsUnsupported": true,
+      "plainChatSystemPrompt": "You are a concise assistant. Reply in plain text only.",
+      "toolExecutionMode": "context_pipeline",
+      "contextPipeline": {
+        "enabled": true,
+        "maxPlannerTokens": 64,
+        "maxReducerTokens": 96,
+        "maxFinalEvidenceChars": 1600,
+        "maxSearchResults": 5,
+        "maxRelevantResults": 3,
+        "enableWebFetch": false,
+        "fetchMaxChars": 3000,
+        "enableCron": true,
+        "defaultReminderTime": "09:00",
+        "timezone": "Europe/Athens"
+      },
+      "toolSelection": {
+        "enabled": true,
+        "mode": "heuristic",
+        "maxTools": 1,
+        "allow": ["web_search", "cron"],
+        "deny": [
+          "apply_patch",
+          "run_cli_app",
+          "complete_goal",
+          "edit_file",
+          "find_files",
+          "grep",
+          "list_dir",
+          "long_task",
+          "message",
+          "read_file",
+          "spawn",
+          "web_fetch",
+          "write_file",
+          "my"
+        ]
+      }
+    }
+  },
+  "memory": {
+    "dream": {
+      "enabled": true,
+      "toolsRequired": false,
+      "skipWhenToolsUnsupported": false,
+      "plainChatFallback": true
+    }
+  },
+  "providers": {
+    "rkllama": {
+      "apiKey": null,
+      "apiBase": "http://rkllama.default.svc.cluster.local:30082/v1",
+      "capabilities": {
+        "tools": false,
+        "toolChoice": false,
+        "parallelToolCalls": false,
+        "responseFormat": false,
+        "maxCompletionTokens": false,
+        "preferMaxTokens": true
+      }
+    }
+  }
+}
