@@ -926,6 +926,139 @@ class AgentLoop:
     def _context_pipeline_cfg(self, name: str, default: Any) -> Any:
         return getattr(self.context_pipeline, name, default)
 
+    def _context_pipeline_chat_history_cfg(self) -> Any:
+        return getattr(self.context_pipeline, "chat_history", None)
+
+    def _context_pipeline_chat_history_enabled(self, action: str) -> bool:
+        cfg = self._context_pipeline_chat_history_cfg()
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return False
+        allowed = getattr(cfg, "include_only_when_action", None) or []
+        if not allowed:
+            return True
+        return action in {str(item) for item in allowed}
+
+    @staticmethod
+    def _context_pipeline_clean_history_text(content: str) -> str:
+        lines: list[str] = []
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if re.match(r"^\[image:\s*(?:/|~)[^\]]*\]$", line, flags=re.I):
+                continue
+            if re.match(r"^\[(?:CLI App Attachment|MCP Preset Attachment):.*\]$", line, flags=re.I):
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
+
+    def _context_pipeline_chat_history(self, session: Session) -> list[dict[str, str]]:
+        cfg = self._context_pipeline_chat_history_cfg()
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return []
+        try:
+            max_turns = max(0, int(getattr(cfg, "max_turns", 4) or 0))
+        except (TypeError, ValueError):
+            max_turns = 4
+        try:
+            max_chars = max(0, int(getattr(cfg, "max_chars", 1500) or 0))
+        except (TypeError, ValueError):
+            max_chars = 1500
+        include_assistant = bool(getattr(cfg, "include_assistant", True))
+        if max_turns <= 0 or max_chars <= 0:
+            logger.info(
+                "Context pipeline chat history turns {}/{} chars {}/{}",
+                0,
+                max_turns,
+                0,
+                max_chars,
+            )
+            return []
+
+        raw_history = session.get_history(
+            max_messages=max(self._max_messages, max_turns * 2 + 4),
+            include_timestamps=False,
+        )
+        plain = self._plain_chat_history(raw_history)
+        kept_reversed: list[dict[str, str]] = []
+        used_chars = 0
+        user_turns = 0
+        for message in reversed(plain):
+            role = str(message.get("role") or "")
+            if role == "assistant" and not include_assistant:
+                continue
+            if role not in {"user", "assistant"}:
+                continue
+            if role == "user" and user_turns >= max_turns:
+                break
+            content = self._context_pipeline_clean_history_text(str(message.get("content") or ""))
+            if not content:
+                continue
+            prefix = "User: " if role == "user" else "Assistant: "
+            entry_chars = len(prefix) + len(content) + 1
+            if kept_reversed and used_chars + entry_chars > max_chars:
+                break
+            if not kept_reversed and entry_chars > max_chars:
+                content = content[: max(0, max_chars - len(prefix) - 1)].rstrip()
+                entry_chars = len(prefix) + len(content) + 1
+            kept_reversed.append({"role": role, "content": content})
+            used_chars += entry_chars
+            if role == "user":
+                user_turns += 1
+        kept = list(reversed(kept_reversed))
+        logger.info(
+            "Context pipeline chat history turns {}/{} chars {}/{}",
+            sum(1 for item in kept if item.get("role") == "user"),
+            max_turns,
+            used_chars,
+            max_chars,
+        )
+        return kept
+
+    def _format_context_pipeline_chat_history(self, history: list[dict[str, str]]) -> str:
+        lines: list[str] = []
+        for message in history:
+            role = "User" if message.get("role") == "user" else "Assistant"
+            content = str(message.get("content") or "").strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return "\n".join(lines)
+
+    def _build_context_pipeline_direct_messages(
+        self,
+        request: str,
+        history: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        working_history = list(history)
+        while True:
+            history_text = self._format_context_pipeline_chat_history(working_history)
+            if history_text:
+                user_prompt = (
+                    f"Recent conversation:\n{history_text}\n\n"
+                    f"Current user:\n{request}\n\n"
+                    "Answer:"
+                )
+            else:
+                user_prompt = request
+            messages = [
+                {"role": "system", "content": self.plain_chat_system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            if self.context_window_tokens <= 0 or not working_history:
+                return self._trim_plain_chat_to_context(messages)
+            prompt_tokens, _ = estimate_prompt_tokens_chain(self.provider, self.model, messages, None)
+            if prompt_tokens <= self.context_window_tokens:
+                return self._trim_plain_chat_to_context(messages)
+            working_history.pop(0)
+
+    @staticmethod
+    def _context_pipeline_history_reference_request(request: str) -> bool:
+        return bool(re.search(
+            r"\b(previous message|last message|what did i just say|what was my .*message|conversation history|chat history|our conversation)\b",
+            request or "",
+            flags=re.I,
+        ))
+
     @staticmethod
     def _looks_like_reminder_request(request: str) -> bool:
         return bool(re.search(
@@ -1122,6 +1255,10 @@ class AgentLoop:
             action = "cron"
         if action not in {"answer_directly", "web_search", "cron", "ask_clarifying"}:
             action = self._context_pipeline_heuristic_plan(request)["action"]
+        if action == "ask_clarifying" and self._context_pipeline_history_reference_request(request):
+            chat_history_cfg = self._context_pipeline_chat_history_cfg()
+            if chat_history_cfg is not None and bool(getattr(chat_history_cfg, "enabled", False)):
+                action = "answer_directly"
         query = str(parsed.get("query") or "").strip()
         if action == "web_search" and not query:
             query = self._plain_chat_search_query(request)
@@ -1393,16 +1530,18 @@ class AgentLoop:
         ctx.context_pipeline_state = {"original_request": request, "planner": plan, "evidence": []}
         action = plan.get("action")
         if action == "ask_clarifying":
+            if self._context_pipeline_chat_history_enabled("ask_clarifying"):
+                history = [item for item in ctx.history if isinstance(item, dict)]
+                ctx.initial_messages = self._build_context_pipeline_direct_messages(request, history)
+                return await self._run_plain_chat_direct(ctx)
             final = str(plan.get("query") or "Can you clarify what you want me to look up?").strip()
             messages = [{"role": "user", "content": request}, {"role": "assistant", "content": final}]
             return final, [], messages, "completed", False
         if action == "cron":
             return await self._run_context_pipeline_cron(ctx, plan)
         if action != "web_search":
-            ctx.initial_messages = self._trim_plain_chat_to_context([
-                {"role": "system", "content": self.plain_chat_system_prompt},
-                {"role": "user", "content": request},
-            ])
+            history = [item for item in ctx.history if isinstance(item, dict)] if self._context_pipeline_chat_history_enabled("answer_directly") else []
+            ctx.initial_messages = self._build_context_pipeline_direct_messages(request, history)
             return await self._run_plain_chat_direct(ctx)
 
         query = str(plan.get("query") or self._plain_chat_search_query(request))
@@ -2312,7 +2451,7 @@ class AgentLoop:
         if ctx.plain_chat:
             logger.info("Plain-chat mode active")
             if self.tool_execution_mode == "context_pipeline":
-                ctx.history = []
+                ctx.history = self._context_pipeline_chat_history(ctx.session)
                 ctx.initial_messages = [
                     {"role": "system", "content": self.plain_chat_system_prompt},
                     {"role": "user", "content": ctx.msg.content},

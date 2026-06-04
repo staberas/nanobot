@@ -20,7 +20,14 @@
         "fetchMaxChars": 3000,
         "enableCron": true,
         "defaultReminderTime": "09:00",
-        "timezone": "Europe/Athens"
+        "timezone": "Europe/Athens",
+        "chatHistory": {
+          "enabled": true,
+          "maxTurns": 4,
+          "maxChars": 1500,
+          "includeAssistant": true,
+          "includeOnlyWhenAction": ["answer_directly", "ask_clarifying"]
+        }
       },
       "toolSelection": {
         "enabled": true,

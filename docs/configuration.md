@@ -1104,7 +1104,14 @@ without chat history, skills, or tool schemas:
         "enableCron": true,
         "defaultReminderTime": "09:00",
         "timezone": "Europe/Athens",
-        "debug": false
+        "debug": false,
+        "chatHistory": {
+          "enabled": true,
+          "maxTurns": 4,
+          "maxChars": 1500,
+          "includeAssistant": true,
+          "includeOnlyWhenAction": ["answer_directly", "ask_clarifying"]
+        }
       },
       "toolSelection": {
         "enabled": true,
@@ -1144,6 +1151,13 @@ without chat history, skills, or tool schemas:
 Configure web search under [`tools.web.search`](#toolswebsearch). The pipeline does not
 persist raw search results or fetched page text into session history; it saves only the
 normal user-visible turn.
+
+For ordinary direct chat, `contextPipeline.chatHistory` adds a compact recent
+conversation window only to final direct-answer/clarification prompts. Planner, reducer,
+web-search, web-fetch, and cron prompts remain no-history by default, so small local
+models keep context for tool evidence instead of replaying full sessions. The history
+window stores only user-visible user/assistant text, drops oldest turns first, and avoids
+local attachment path breadcrumbs.
 
 For reminders, set `contextPipeline.enableCron: true`, allow `cron` in `toolSelection`,
 and run nanobot with cron enabled. When the planner classifies a request such as

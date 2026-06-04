@@ -67,6 +67,13 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
             "enableCron": True,
             "defaultReminderTime": "08:30",
             "timezone": "Europe/Athens",
+            "chatHistory": {
+                "enabled": True,
+                "maxTurns": 3,
+                "maxChars": 900,
+                "includeAssistant": False,
+                "includeOnlyWhenAction": ["answer_directly"],
+            },
         },
     })
 
@@ -79,6 +86,11 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
     assert defaults.context_pipeline.enable_cron is True
     assert defaults.context_pipeline.default_reminder_time == "08:30"
     assert defaults.context_pipeline.timezone == "Europe/Athens"
+    assert defaults.context_pipeline.chat_history.enabled is True
+    assert defaults.context_pipeline.chat_history.max_turns == 3
+    assert defaults.context_pipeline.chat_history.max_chars == 900
+    assert defaults.context_pipeline.chat_history.include_assistant is False
+    assert defaults.context_pipeline.chat_history.include_only_when_action == ["answer_directly"]
 
 
 def test_plain_chat_bypasses_tool_loop_when_provider_lacks_tools(tmp_path) -> None:
@@ -325,6 +337,9 @@ def test_context_pipeline_direct_answer_uses_tiny_no_history_prompt(tmp_path) ->
             context_window_tokens=2048,
             plain_chat_when_tools_unsupported=True,
             tool_execution_mode="context_pipeline",
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {"chatHistory": {"enabled": False}}
+            }).context_pipeline,
         )
         loop.context.build_messages = AsyncMock(side_effect=AssertionError("tool prompt built"))
         loop.tools.get_definitions = MagicMock(side_effect=AssertionError("tools requested"))
@@ -343,6 +358,209 @@ def test_context_pipeline_direct_answer_uses_tiny_no_history_prompt(tmp_path) ->
         assert "old prompt should not be included" not in final_prompt
         assert provider.calls[-1]["tools"] is None
         assert "tool_choice" not in provider.calls[-1]
+    asyncio.run(run())
+
+
+def test_context_pipeline_direct_chat_history_answers_previous_message(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"answer_directly","query":"","reason":"chat"}',
+                'I\'m not sure what you mean by "my clanker."',
+                '{"action":"answer_directly","query":"","reason":"chat"}',
+                "okay",
+                '{"action":"ask_clarifying","query":"Could you clarify?","reason":"history"}',
+                'Your previous message was: "dont worry bout it"',
+            ],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {
+                    "chatHistory": {
+                        "enabled": True,
+                        "maxTurns": 4,
+                        "maxChars": 1500,
+                        "includeAssistant": True,
+                    }
+                }
+            }).context_pipeline,
+        )
+        loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="room",
+                content="what's up my clanker?",
+            )
+        )
+        await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="room",
+                content="dont worry bout it",
+            )
+        )
+        result = await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="room",
+                content="what was my previous message",
+            )
+        )
+
+        assert result is not None
+        assert result.content == 'Your previous message was: "dont worry bout it"'
+        final_prompt = "\n".join(
+            str(message.get("content", "")) for message in provider.calls[-1]["messages"]
+        )
+        assert "Recent conversation:" in final_prompt
+        assert "User: what's up my clanker?" in final_prompt
+        assert 'Assistant: I\'m not sure what you mean by "my clanker."' in final_prompt
+        assert "User: dont worry bout it" in final_prompt
+        assert "Current user:\nwhat was my previous message" in final_prompt
+        assert provider.calls[-1]["tools"] is None
+        assert "tool_choice" not in provider.calls[-1]
+    asyncio.run(run())
+
+
+def test_context_pipeline_direct_chat_history_respects_turn_and_char_limits(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"answer_directly","query":"","reason":"chat"}',
+                "done",
+            ],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {
+                    "chatHistory": {"enabled": True, "maxTurns": 1, "maxChars": 120}
+                }
+            }).context_pipeline,
+        )
+        session = loop.sessions.get_or_create("matrix:room")
+        session.add_message("user", "very old message that should be dropped")
+        session.add_message("assistant", "very old answer that should be dropped")
+        session.add_message("user", "recent short message")
+        session.add_message("assistant", "recent short answer")
+        loop.sessions.save(session)
+
+        result = await loop._process_message(
+            InboundMessage(channel="matrix", sender_id="@u:s", chat_id="room", content="continue")
+        )
+
+        assert result is not None
+        final_prompt = "\n".join(
+            str(message.get("content", "")) for message in provider.calls[-1]["messages"]
+        )
+        assert "recent short message" in final_prompt
+        assert "recent short answer" in final_prompt
+        assert "very old message" not in final_prompt
+        prompt_tokens, _ = estimate_prompt_tokens_chain(provider, "fake-small", provider.calls[-1]["messages"], None)
+        assert prompt_tokens < 2048
+    asyncio.run(run())
+
+
+def test_context_pipeline_chat_history_strips_attachment_paths(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"answer_directly","query":"","reason":"chat"}',
+                "ok",
+            ],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        image_path = tmp_path / "private-image.png"
+        image_path.write_text("fake", encoding="utf-8")
+        session = loop.sessions.get_or_create("matrix:room")
+        session.add_message("user", "see attached", media=[str(image_path)])
+        session.add_message("assistant", "I can only process text in this mode.")
+        loop.sessions.save(session)
+
+        result = await loop._process_message(
+            InboundMessage(channel="matrix", sender_id="@u:s", chat_id="room", content="what did I just say")
+        )
+
+        assert result is not None
+        final_prompt = "\n".join(
+            str(message.get("content", "")) for message in provider.calls[-1]["messages"]
+        )
+        assert "see attached" in final_prompt
+        assert str(image_path) not in final_prompt
+        assert "[image:" not in final_prompt
+    asyncio.run(run())
+
+
+def test_context_pipeline_new_clears_direct_chat_history(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"answer_directly","query":"","reason":"chat"}',
+                "fresh",
+            ],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            max_iterations=0,
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        session = loop.sessions.get_or_create("matrix:room")
+        session.add_message("user", "stale message")
+        session.add_message("assistant", "stale answer")
+        loop.sessions.save(session)
+
+        await loop._process_message(
+            InboundMessage(channel="matrix", sender_id="@u:s", chat_id="room", content="/new")
+        )
+        result = await loop._process_message(
+            InboundMessage(channel="matrix", sender_id="@u:s", chat_id="room", content="hello again")
+        )
+
+        assert result is not None
+        final_prompt = "\n".join(
+            str(message.get("content", "")) for message in provider.calls[-1]["messages"]
+        )
+        assert "stale message" not in final_prompt
+        assert "stale answer" not in final_prompt
+        assert "hello again" in final_prompt
     asyncio.run(run())
 
 

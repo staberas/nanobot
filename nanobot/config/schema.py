@@ -100,6 +100,18 @@ class InlineFallbackConfig(Base):
 FallbackCandidate = str | InlineFallbackConfig
 
 
+class ContextPipelineChatHistoryConfig(Base):
+    """Small direct-chat history window for context-pipeline final prompts."""
+
+    enabled: bool = True
+    max_turns: int = Field(default=4, ge=0, le=20)
+    max_chars: int = Field(default=1500, ge=0, le=20_000)
+    include_assistant: bool = True
+    include_only_when_action: list[str] = Field(
+        default_factory=lambda: ["answer_directly", "ask_clarifying"]
+    )
+
+
 class ContextPipelineConfig(Base):
     """Context-economy middleware settings for plain-chat tool execution."""
 
@@ -115,6 +127,9 @@ class ContextPipelineConfig(Base):
     default_reminder_time: str = "09:00"
     timezone: str | None = None
     debug: bool = False
+    chat_history: ContextPipelineChatHistoryConfig = Field(
+        default_factory=ContextPipelineChatHistoryConfig
+    )
 
 
 class ToolSelectionConfig(Base):
