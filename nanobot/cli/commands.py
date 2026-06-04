@@ -1214,7 +1214,7 @@ def _run_gateway(
         async with server:
             await server.serve_forever()
     # Register Dream system job (idempotent on restart)
-    dream_cfg = config.agents.defaults.dream
+    dream_cfg = config.effective_dream_config
     if dream_cfg.model_override:
         agent.dream.model = dream_cfg.model_override
     agent.dream.max_batch_size = dream_cfg.max_batch_size

@@ -806,3 +806,37 @@ def test_plain_chat_text_only_guard_rejects_media_without_llm(tmp_path) -> None:
         assert "I can only process text in this mode" in result.content
         assert provider.calls == []
     asyncio.run(run())
+
+
+def test_agent_loop_from_config_uses_top_level_memory_dream(tmp_path) -> None:
+    from nanobot.config.schema import Config
+
+    config = Config.model_validate({
+        "memory": {
+            "dream": {
+                "enabled": True,
+                "toolsRequired": False,
+                "skipWhenToolsUnsupported": True,
+                "plainChatFallback": False,
+            }
+        },
+        "agents": {
+            "defaults": {
+                "workspace": str(tmp_path),
+                "provider": "rkllama",
+                "model": "Qwen3-4B-w8a8-npu",
+            }
+        },
+        "providers": {
+            "rkllama": {
+                "apiKey": None,
+                "apiBase": "http://192.168.100.23:30082/v1",
+                "capabilities": {"tools": False, "preferMaxTokens": True},
+            }
+        },
+    })
+
+    loop = AgentLoop.from_config(config, bus=MessageBus(), provider=PlainFakeProvider(supports_tools=False))
+
+    assert loop.dream.skip_when_tools_unsupported is True
+    assert loop.dream.plain_chat_fallback is False

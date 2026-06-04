@@ -80,6 +80,12 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class MemoryConfig(Base):
+    """Memory subsystem configuration."""
+
+    dream: DreamConfig = Field(default_factory=DreamConfig)
+
+
 class InlineFallbackConfig(Base):
     """One inline fallback model configuration."""
 
@@ -420,6 +426,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),
@@ -429,6 +436,11 @@ class Config(BaseSettings):
         if not type(self).__pydantic_complete__:
             _resolve_tool_config_refs()
         super().__init__(**values)
+
+    @property
+    def effective_dream_config(self) -> DreamConfig:
+        """Return top-level memory.dream when configured, else legacy agents.defaults.dream."""
+        return self.memory.dream if "memory" in self.model_fields_set else self.agents.defaults.dream
 
     @model_validator(mode="after")
     def _validate_model_preset(self) -> "Config":

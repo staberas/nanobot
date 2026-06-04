@@ -42,7 +42,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.config.schema import AgentDefaults, ModelPresetConfig
+from nanobot.config.schema import AgentDefaults, DreamConfig, ModelPresetConfig
 from nanobot.cron.types import CronSchedule
 from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.factory import ProviderSnapshot
@@ -211,6 +211,7 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
+        dream_config: DreamConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
         provider_snapshot_loader: Callable[..., ProviderSnapshot] | None = None,
@@ -353,17 +354,18 @@ class AgentLoop:
             consolidator=self.consolidator,
             session_ttl_minutes=session_ttl_minutes,
         )
+        dream_cfg = dream_config or defaults.dream
         self.dream = Dream(
             store=self.context.memory,
             provider=provider,
             model=self.model,
-            max_batch_size=defaults.dream.max_batch_size,
-            max_iterations=defaults.dream.max_iterations,
+            max_batch_size=dream_cfg.max_batch_size,
+            max_iterations=dream_cfg.max_iterations,
             max_tool_result_chars=self.max_tool_result_chars,
-            annotate_line_ages=defaults.dream.annotate_line_ages,
-            tools_required=defaults.dream.tools_required,
-            skip_when_tools_unsupported=defaults.dream.skip_when_tools_unsupported,
-            plain_chat_fallback=defaults.dream.plain_chat_fallback,
+            annotate_line_ages=dream_cfg.annotate_line_ages,
+            tools_required=dream_cfg.tools_required,
+            skip_when_tools_unsupported=dream_cfg.skip_when_tools_unsupported,
+            plain_chat_fallback=dream_cfg.plain_chat_fallback,
         )
         self.model_presets: dict[str, ModelPresetConfig] = model_presets or {}
         self._active_preset: str | None = None
@@ -438,6 +440,7 @@ class AgentLoop:
                 defaults.tool_result_injection_max_chars,
             ),
             context_pipeline=getattr(resolved, "context_pipeline", defaults.context_pipeline),
+            dream_config=config.effective_dream_config,
             restrict_to_workspace=config.tools.restrict_to_workspace,
             mcp_servers=config.tools.mcp_servers,
             channels_config=config.channels,

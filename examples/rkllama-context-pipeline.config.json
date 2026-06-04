@@ -43,13 +43,15 @@
           "write_file",
           "my"
         ]
-      },
-      "dream": {
-        "enabled": true,
-        "toolsRequired": false,
-        "skipWhenToolsUnsupported": false,
-        "plainChatFallback": true
       }
+    }
+  },
+  "memory": {
+    "dream": {
+      "enabled": true,
+      "toolsRequired": false,
+      "skipWhenToolsUnsupported": false,
+      "plainChatFallback": true
     }
   },
   "providers": {

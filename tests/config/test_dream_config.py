@@ -63,3 +63,76 @@ def test_dream_config_accepts_toolless_fallback_flags() -> None:
     assert dumped["toolsRequired"] is False
     assert dumped["skipWhenToolsUnsupported"] is True
     assert dumped["plainChatFallback"] is False
+
+
+def test_top_level_memory_dream_exact_live_config_parses() -> None:
+    from nanobot.config.schema import Config
+
+    config = Config.model_validate({
+        "memory": {
+            "dream": {
+                "enabled": True,
+                "toolsRequired": False,
+                "skipWhenToolsUnsupported": False,
+                "plainChatFallback": True,
+            }
+        },
+        "providers": {
+            "rkllama": {
+                "apiKey": None,
+                "apiBase": "http://192.168.100.23:30082/v1",
+                "capabilities": {"tools": False, "preferMaxTokens": True},
+            }
+        },
+        "agents": {
+            "defaults": {
+                "provider": "rkllama",
+                "model": "Qwen3-4B-w8a8-npu",
+            }
+        },
+    })
+
+    assert config.memory.dream.enabled is True
+    assert config.memory.dream.tools_required is False
+    assert config.memory.dream.skip_when_tools_unsupported is False
+    assert config.memory.dream.plain_chat_fallback is True
+    assert config.effective_dream_config is config.memory.dream
+    assert config.agents.defaults.provider == "rkllama"
+    assert config.providers.__pydantic_extra__["rkllama"].api_base == "http://192.168.100.23:30082/v1"
+
+
+def test_load_config_does_not_fallback_when_top_level_memory_dream_present(tmp_path) -> None:
+    import json
+
+    from nanobot.config.loader import load_config
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "memory": {
+            "dream": {
+                "enabled": True,
+                "toolsRequired": False,
+                "skipWhenToolsUnsupported": False,
+                "plainChatFallback": True,
+            }
+        },
+        "providers": {
+            "rkllama": {
+                "apiKey": None,
+                "apiBase": "http://192.168.100.23:30082/v1",
+                "capabilities": {"tools": False, "preferMaxTokens": True},
+            }
+        },
+        "agents": {
+            "defaults": {
+                "provider": "rkllama",
+                "model": "Qwen3-4B-w8a8-npu",
+            }
+        },
+    }), encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.agents.defaults.provider == "rkllama"
+    assert config.agents.defaults.model == "Qwen3-4B-w8a8-npu"
+    assert config.effective_dream_config.plain_chat_fallback is True
