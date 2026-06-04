@@ -1053,6 +1053,21 @@ def _run_gateway(
                 logger.info("Heartbeat: silenced by post-run evaluation")
             return response
 
+        if job.payload.deliver and job.payload.channel_meta.get("_context_pipeline_reminder"):
+            content = f"Reminder: {job.payload.message}"
+            if job.payload.to:
+                await _deliver_to_channel(
+                    OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content=content,
+                        metadata=dict(job.payload.channel_meta),
+                    ),
+                    record=True,
+                    session_key=job.payload.session_key,
+                )
+            return content
+
         reminder_note = (
             "The scheduled time has arrived. Deliver this reminder to the user now, "
             "as a brief and natural message in their language. Speak directly to them — "
