@@ -319,6 +319,101 @@ def test_context_pipeline_planner_actions_and_fallback(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_context_pipeline_planner_uses_history_for_reference_messages(tmp_path) -> None:
+    async def run() -> None:
+        reference_provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"ask_clarifying","query":"What are you referring to?","reason":"pronoun"}',
+                '{"action":"ask_clarifying","query":"Which previous message?","reason":"history"}',
+            ],
+        )
+        reference_loop = AgentLoop(
+            bus=MessageBus(),
+            provider=reference_provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+
+        that_plan = await reference_loop._context_pipeline_plan(
+            "do you know what that means?",
+            recent_chat_history_available=True,
+        )
+        previous_plan = await reference_loop._context_pipeline_plan(
+            "what was my previous message?",
+            recent_chat_history_available=True,
+        )
+
+        assert that_plan["action"] == "answer_directly"
+        assert previous_plan["action"] == "answer_directly"
+        planner_prompt = reference_provider.calls[0]["messages"][0]["content"]
+        assert "If the user refers to previous messages" in planner_prompt
+        assert "Recent chat history available: yes" in planner_prompt
+
+        empty_provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"ask_clarifying","query":"What are you referring to?","reason":"pronoun"}'],
+        )
+        empty_loop = AgentLoop(
+            bus=MessageBus(),
+            provider=empty_provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        empty_plan = await empty_loop._context_pipeline_plan(
+            "do you know what that means?",
+            recent_chat_history_available=False,
+        )
+        assert empty_plan["action"] == "ask_clarifying"
+        empty_prompt = empty_provider.calls[0]["messages"][0]["content"]
+        assert "Recent chat history available: no" in empty_prompt
+
+        search_provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"ask_clarifying","query":"What should I search?","reason":"ambiguous"}'],
+        )
+        search_loop = AgentLoop(
+            bus=MessageBus(),
+            provider=search_provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        search_plan = await search_loop._context_pipeline_plan(
+            "search Jason Kolios Greece",
+            recent_chat_history_available=True,
+        )
+        assert search_plan["action"] == "web_search"
+
+        cron_provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"ask_clarifying","query":"When?","reason":"ambiguous"}'],
+        )
+        cron_loop = AgentLoop(
+            bus=MessageBus(),
+            provider=cron_provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        cron_plan = await cron_loop._context_pipeline_plan(
+            "remind me in 2 min to check the cluster",
+            recent_chat_history_available=True,
+        )
+        assert cron_plan["action"] == "cron"
+    asyncio.run(run())
+
+
 def test_context_pipeline_direct_answer_uses_tiny_no_history_prompt(tmp_path) -> None:
     async def run() -> None:
         provider = PlainFakeProvider(

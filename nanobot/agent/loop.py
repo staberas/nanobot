@@ -1053,11 +1053,21 @@ class AgentLoop:
 
     @staticmethod
     def _context_pipeline_history_reference_request(request: str) -> bool:
-        return bool(re.search(
-            r"\b(previous message|last message|what did i just say|what was my .*message|conversation history|chat history|our conversation)\b",
-            request or "",
+        text = (request or "").strip()
+        if not text:
+            return False
+        if re.search(
+            r"\b("
+            r"previous message|last message|what did i just say|what was my .*message|"
+            r"what did i call you|what.*called you|conversation history|chat history|"
+            r"our conversation|what does that mean|do you know what that means|"
+            r"what about it|explain that|continue"
+            r")\b",
+            text,
             flags=re.I,
-        ))
+        ):
+            return True
+        return bool(re.fullmatch(r"\s*(?:yes|no|ok|okay|thanks|thank you)\s*[.!?]*\s*", text, flags=re.I))
 
     @staticmethod
     def _looks_like_reminder_request(request: str) -> bool:
@@ -1225,6 +1235,8 @@ class AgentLoop:
         self,
         request: str,
         on_retry_wait: Callable[[str], Awaitable[None]] | None = None,
+        *,
+        recent_chat_history_available: bool = False,
     ) -> dict[str, Any]:
         prompt = (
             "You are a routing controller. Choose one action.\n\n"
@@ -1234,7 +1246,10 @@ class AgentLoop:
             "- cron: schedule a reminder or recurring task\n"
             "- ask_clarifying: ask one short clarification question\n\n"
             "For cron, include reminder_text plus at (ISO datetime) or cron_expr and timezone. "
-            "Never claim a reminder was scheduled via answer_directly.\n\n"
+            "Never claim a reminder was scheduled via answer_directly. "
+            "If the user refers to previous messages and recent chat history is available, "
+            "choose answer_directly.\n\n"
+            f"Recent chat history available: {'yes' if recent_chat_history_available else 'no'}\n\n"
             f"User request:\n{request}\n\n"
             "Return JSON only:\n"
             '{"action":"answer_directly|web_search|cron|ask_clarifying","query":"...","reminder_text":"...","at":"...","cron_expr":"...","timezone":"...","reason":"..."}'
@@ -1253,12 +1268,19 @@ class AgentLoop:
         action = str(parsed.get("action") or "answer_directly").strip()
         if action == "schedule_reminder":
             action = "cron"
+        heuristic: dict[str, Any] | None = None
         if action not in {"answer_directly", "web_search", "cron", "ask_clarifying"}:
-            action = self._context_pipeline_heuristic_plan(request)["action"]
-        if action == "ask_clarifying" and self._context_pipeline_history_reference_request(request):
-            chat_history_cfg = self._context_pipeline_chat_history_cfg()
-            if chat_history_cfg is not None and bool(getattr(chat_history_cfg, "enabled", False)):
-                action = "answer_directly"
+            heuristic = self._context_pipeline_heuristic_plan(request)
+            action = heuristic["action"]
+        if action == "ask_clarifying":
+            heuristic = heuristic or self._context_pipeline_heuristic_plan(request)
+            if heuristic.get("action") in {"web_search", "cron"}:
+                parsed = {**heuristic, **parsed, "action": heuristic["action"]}
+                action = str(heuristic["action"])
+            elif recent_chat_history_available and self._context_pipeline_history_reference_request(request):
+                chat_history_cfg = self._context_pipeline_chat_history_cfg()
+                if chat_history_cfg is not None and bool(getattr(chat_history_cfg, "enabled", False)):
+                    action = "answer_directly"
         query = str(parsed.get("query") or "").strip()
         if action == "web_search" and not query:
             query = self._plain_chat_search_query(request)
@@ -1526,7 +1548,11 @@ class AgentLoop:
         ctx: TurnContext,
     ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
         request = ctx.msg.content.strip()
-        plan = await self._context_pipeline_plan(request, ctx.on_retry_wait)
+        plan = await self._context_pipeline_plan(
+            request,
+            ctx.on_retry_wait,
+            recent_chat_history_available=bool(ctx.history),
+        )
         ctx.context_pipeline_state = {"original_request": request, "planner": plan, "evidence": []}
         action = plan.get("action")
         if action == "ask_clarifying":
