@@ -199,3 +199,29 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.nanobot.gateway.plist
 After editing the plist, run `launchctl bootout ...` and `launchctl bootstrap ...` again.
 
 > **Note:** if startup fails with "address already in use", stop the manually started `nanobot gateway` process first.
+
+## Kubernetes / k3s image-first deployment
+
+For Kubernetes or k3s, build nanobot into an image once and run that immutable image in the
+pod. Do **not** clone the Git repository or create a Python virtualenv from an init script on
+every restart; that makes restarts dependent on GitHub/PyPI and slows recovery.
+
+```bash
+# Build and push once from a checkout/CI runner.
+docker build -t registry.example.com/nanobot:rkllama-context-pipeline .
+docker push registry.example.com/nanobot:rkllama-context-pipeline
+
+# Deploy the prebuilt image.
+kubectl apply -f deploy/k8s/nanobot-gateway.yaml
+```
+
+Edit `deploy/k8s/nanobot-gateway.yaml` and set `spec.template.spec.containers[0].image`
+to your registry tag. Mount `/home/nanobot/.nanobot` on a PVC so `config.json`, sessions,
+Dream memory, and cron jobs survive pod restarts. The example manifest keeps the runtime
+entrypoint as `nanobot gateway`; it does not run `pip install`, `uv sync`, or `git clone`
+inside the pod.
+
+A working RKLLAMA/context-pipeline config skeleton is available at
+[`examples/rkllama-context-pipeline.config.json`](../examples/rkllama-context-pipeline.config.json).
+Merge it into the mounted `/home/nanobot/.nanobot/config.json` and adjust the RKLLAMA
+service DNS name, Matrix credentials, and web-search provider for your cluster.

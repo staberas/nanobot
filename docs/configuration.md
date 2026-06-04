@@ -983,8 +983,199 @@ Existing configs do not need to change. If you do not set `modelPresets` or `age
 | `contextWindowTokens` | Context window size used by prompt building and consolidation decisions. |
 | `temperature` | Sampling temperature. |
 | `reasoningEffort` | Optional reasoning/thinking setting. Provider support varies. |
+| `toolSelection` | Optional policy that limits which tools are exposed or selected for a turn. Useful with small-model modes below. |
+| `plainChatWhenToolsUnsupported` | When `true`, providers that report `capabilities.tools=false` bypass the tool-calling agent loop and use a plain chat request. |
+| `plainChatSystemPrompt` | Minimal system prompt used by plain-chat modes. |
+| `toolExecutionMode` | Tool execution strategy: `tool_calls` (default), `prompt_injection`, or `context_pipeline`. |
+| `toolResultInjectionMaxChars` | Character budget for injected tool results in `prompt_injection` mode. |
+| `contextPipeline` | Planner/reducer settings for `context_pipeline` mode. |
 
 `default` is reserved and always means the implicit preset built from `agents.defaults.*`; do not define `modelPresets.default`. Use `/model default` to switch back to `agents.defaults.*`.
+
+### Small/local models without tool calling
+
+Some OpenAI-compatible local servers can answer chat completions but cannot consume OpenAI
+tool schemas. For these providers, set provider capabilities and choose a plain-chat tool
+execution mode. This keeps prompts small and avoids sending unsupported `tools`,
+`tool_choice`, `parallel_tool_calls`, or `response_format` fields.
+
+```json
+{
+  "providers": {
+    "rkllama": {
+      "apiKey": null,
+      "apiBase": "http://localhost:30082/v1",
+      "capabilities": {
+        "tools": false,
+        "toolChoice": false,
+        "parallelToolCalls": false,
+        "responseFormat": false,
+        "maxCompletionTokens": false,
+        "preferMaxTokens": true
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "rkllama",
+      "model": "Qwen3-4B-w8a8-npu",
+      "contextWindowTokens": 2048,
+      "maxTokens": 160,
+      "maxToolIterations": 0,
+      "plainChatWhenToolsUnsupported": true,
+      "plainChatSystemPrompt": "You are a concise assistant. Reply in plain text only.",
+      "toolExecutionMode": "context_pipeline"
+    }
+  }
+}
+```
+
+Plain-chat routing is activated when the selected provider reports
+`capabilities.tools=false`. In this route, `maxToolIterations: 0` means "do not run the
+tool loop" rather than "fail immediately"; nanobot makes ordinary chat-completions calls
+with no OpenAI tool schema fields.
+
+#### `toolExecutionMode`
+
+| Mode | Behavior | Best for |
+|------|----------|----------|
+| `tool_calls` | Normal agent loop with model-visible tool schemas and tool-call iterations. | Tool-capable hosted models and local servers with working tool parsing. |
+| `prompt_injection` | Heuristic tool selection runs selected lightweight tools internally, currently `web_search`, trims the result, injects compact text into one plain-chat prompt, then calls the provider once. | Small models that need basic search without function calling. |
+| `context_pipeline` | Uses tiny no-history planner prompts, executes allowed tools internally, asks reducer prompts to keep compact evidence for search, then sends one final no-history evidence prompt. Cron/reminder requests are scheduled directly through Nanobot's cron service when `cron` is explicitly allowed. | Context-constrained local models where history, tool schemas, and raw pages would overflow the context window. |
+
+#### Prompt-injected search
+
+`prompt_injection` is the simpler fallback. It relies on `toolSelection` to decide whether
+`web_search` is allowed and selected for the user request:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "plainChatWhenToolsUnsupported": true,
+      "toolExecutionMode": "prompt_injection",
+      "toolResultInjectionMaxChars": 1200,
+      "toolSelection": {
+        "enabled": true,
+        "mode": "heuristic",
+        "maxTools": 1,
+        "allow": ["web_search"],
+        "deny": ["apply_patch", "run_cli_app", "edit_file", "read_file", "write_file"]
+      }
+    }
+  }
+}
+```
+
+When the heuristic selects `web_search`, nanobot runs the search outside the model, injects
+a compact result block, and makes one provider request with `tools: null`.
+
+#### Context pipeline
+
+`context_pipeline` is more context-efficient. Each middleware step uses a fresh tiny prompt
+without chat history, skills, or tool schemas:
+
+1. **Planner**: choose `answer_directly`, `web_search`, or `ask_clarifying` and optionally
+   produce a search query.
+2. **Search**: run `web_search` internally when selected.
+3. **Reducer**: ask the model to judge each search result and store only compact evidence
+   notes (`title`, `url`, `summary`, `score`). If JSON parsing fails, nanobot falls back to
+   simple query-term matching.
+4. **Optional fetch reducer**: when enabled, fetch top URLs, trim page text, and summarize
+   again. This is disabled by default for small context windows.
+5. **Final answer**: send one final prompt containing only the original request and compact
+   evidence.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "plainChatWhenToolsUnsupported": true,
+      "toolExecutionMode": "context_pipeline",
+      "contextPipeline": {
+        "enabled": true,
+        "maxPlannerTokens": 64,
+        "maxReducerTokens": 96,
+        "maxFinalEvidenceChars": 1600,
+        "maxSearchResults": 5,
+        "maxRelevantResults": 3,
+        "enableWebFetch": false,
+        "fetchMaxChars": 3000,
+        "enableCron": true,
+        "defaultReminderTime": "09:00",
+        "timezone": "Europe/Athens",
+        "debug": false,
+        "chatHistory": {
+          "enabled": true,
+          "maxTurns": 4,
+          "maxChars": 1500,
+          "includeAssistant": true,
+          "includeOnlyWhenAction": ["answer_directly", "ask_clarifying"]
+        }
+      },
+      "toolSelection": {
+        "enabled": true,
+        "mode": "heuristic",
+        "maxTools": 1,
+        "allow": ["web_search", "web_fetch", "cron"],
+        "deny": ["apply_patch", "run_cli_app", "edit_file", "read_file", "write_file"]
+      }
+    }
+  },
+  "memory": {
+    "dream": {
+      "enabled": true,
+      "toolsRequired": false,
+      "skipWhenToolsUnsupported": false,
+      "plainChatFallback": true
+    }
+  }
+}
+```
+
+| `contextPipeline` option | Default | Description |
+|--------------------------|---------|-------------|
+| `enabled` | `true` | Enable the pipeline when `toolExecutionMode` is `context_pipeline`. |
+| `maxPlannerTokens` | `64` | Output-token cap for the planner JSON call. |
+| `maxReducerTokens` | `96` | Output-token cap for each reducer/summarizer JSON call. |
+| `maxFinalEvidenceChars` | `1600` | Maximum compact evidence injected into the final answer prompt. |
+| `maxSearchResults` | `5` | Search results requested and considered by the reducer. |
+| `maxRelevantResults` | `3` | Top reduced evidence items kept for the final prompt. |
+| `enableWebFetch` | `false` | Fetch and summarize top result pages. Leave off for very small models unless needed. |
+| `fetchMaxChars` | `3000` | Maximum page text passed to the fetch reducer. |
+| `enableCron` | `false` | Enable deterministic reminder scheduling through CronService when `cron` is also allowed by `toolSelection`. |
+| `defaultReminderTime` | `"09:00"` | Default HH:MM used for phrases such as `every morning` or date-only reminders. |
+| `timezone` | `null` | Optional IANA timezone for context-pipeline reminders, for example `Europe/Athens`; falls back to the agent timezone or UTC. |
+| `debug` | `false` | Reserved for additional pipeline diagnostics. |
+
+Configure web search under [`tools.web.search`](#toolswebsearch). The pipeline does not
+persist raw search results or fetched page text into session history; it saves only the
+normal user-visible turn.
+
+For ordinary direct chat, `contextPipeline.chatHistory` adds a compact recent
+conversation window only to final direct-answer/clarification prompts. Planner, reducer,
+web-search, web-fetch, and cron prompts remain no-history by default, so small local
+models keep context for tool evidence instead of replaying full sessions. The history
+window stores only user-visible user/assistant text, drops oldest turns first, and avoids
+local attachment path breadcrumbs.
+
+For reminders, set `contextPipeline.enableCron: true`, allow `cron` in `toolSelection`,
+and run nanobot with cron enabled. When the planner classifies a request such as
+`remind me in 2 min to check the cluster` or `remind me tomorrow at 9 to check the
+cluster` as `cron`, nanobot parses the schedule deterministically, creates the job through
+the existing CronService job store, and confirms only after the job is registered. If cron
+is disabled, denied, unavailable, or the time is ambiguous, the bot refuses safely or asks
+for the missing time instead of claiming that a reminder was set.
+
+Dream remains enabled by default. For providers with `capabilities.tools=false`, set
+`memory.dream.plainChatFallback: true` so Dream performs no-tool memory summarization
+instead of requesting `read_file`, `edit_file`, or `write_file`. The legacy
+`agents.defaults.dream` path is still accepted when top-level `memory` is omitted, but new
+configs should use top-level `memory.dream`. If you prefer Dream to do nothing on toolless
+providers, set `plainChatFallback: false` or `skipWhenToolsUnsupported: true`; it will log
+that Dream was skipped instead of attempting tool workflows. Plain-chat/context-pipeline providers are also text-only for attachments: if
+an image or other unextracted attachment remains on the message, nanobot refuses that turn
+rather than silently sending unsupported media to a text-only model.
 
 ### Model Fallbacks
 
