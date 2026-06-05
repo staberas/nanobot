@@ -10,6 +10,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults
 from nanobot.cron.service import CronService
 from nanobot.providers.base import GenerationSettings, LLMProvider, LLMResponse
+from nanobot.providers.factory import ProviderSnapshot
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.utils.helpers import estimate_prompt_tokens_chain
 
@@ -67,6 +68,17 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
             "enableCron": True,
             "defaultReminderTime": "08:30",
             "timezone": "Europe/Athens",
+            "enableCloudEscalation": True,
+            "cloudEscalation": {
+                "enabled": True,
+                "providerPreset": "cloud-agent",
+                "requireExplicitTrigger": True,
+                "maxSummaryChars": 700,
+                "maxReportChars": 1200,
+                "appendFullReport": True,
+                "returnCloudDirectly": False,
+                "timeoutSeconds": 30,
+            },
             "chatHistory": {
                 "enabled": True,
                 "maxTurns": 3,
@@ -86,6 +98,13 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
     assert defaults.context_pipeline.enable_cron is True
     assert defaults.context_pipeline.default_reminder_time == "08:30"
     assert defaults.context_pipeline.timezone == "Europe/Athens"
+    assert defaults.context_pipeline.enable_cloud_escalation is True
+    assert defaults.context_pipeline.cloud_escalation.enabled is True
+    assert defaults.context_pipeline.cloud_escalation.provider_preset == "cloud-agent"
+    assert defaults.context_pipeline.cloud_escalation.require_explicit_trigger is True
+    assert defaults.context_pipeline.cloud_escalation.max_summary_chars == 700
+    assert defaults.context_pipeline.cloud_escalation.max_report_chars == 1200
+    assert defaults.context_pipeline.cloud_escalation.timeout_seconds == 30
     assert defaults.context_pipeline.chat_history.enabled is True
     assert defaults.context_pipeline.chat_history.max_turns == 3
     assert defaults.context_pipeline.chat_history.max_chars == 900
@@ -411,6 +430,218 @@ def test_context_pipeline_planner_uses_history_for_reference_messages(tmp_path) 
             recent_chat_history_available=True,
         )
         assert cron_plan["action"] == "cron"
+    asyncio.run(run())
+
+
+def test_context_pipeline_cloud_escalation_planning_rules(tmp_path) -> None:
+    async def run() -> None:
+        cfg = AgentDefaults.model_validate({
+            "contextPipeline": {
+                "enableCloudEscalation": True,
+                "cloudEscalation": {"enabled": True, "requireExplicitTrigger": False},
+            }
+        }).context_pipeline
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"answer_directly","query":"","reason":"casual"}',
+                '{"action":"escalate_cloud_agent","query":"Jason Kolios Greece","reason":"too eager"}',
+                '{"action":"escalate_cloud_agent","query":"deep research Jason Kolios Greece","reason":"research"}',
+            ],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=cfg,
+        )
+
+        hello = await loop._context_pipeline_plan("hello")
+        search = await loop._context_pipeline_plan("search Jason Kolios Greece")
+        deep = await loop._context_pipeline_plan("deep research Jason Kolios Greece")
+
+        assert hello["action"] == "answer_directly"
+        assert search["action"] == "web_search"
+        assert deep["action"] == "escalate_cloud_agent"
+
+        explicit_cfg = AgentDefaults.model_validate({
+            "contextPipeline": {
+                "enableCloudEscalation": True,
+                "cloudEscalation": {"enabled": True, "requireExplicitTrigger": True},
+            }
+        }).context_pipeline
+        explicit_provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"escalate_cloud_agent","query":"architecture review","reason":"complex"}',
+                '{"action":"escalate_cloud_agent","query":"use cloud architecture review","reason":"explicit"}',
+            ],
+        )
+        explicit_loop = AgentLoop(
+            bus=MessageBus(),
+            provider=explicit_provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=explicit_cfg,
+        )
+
+        blocked = await explicit_loop._context_pipeline_plan("architecture review this design")
+        allowed = await explicit_loop._context_pipeline_plan("use cloud architecture review this design")
+
+        assert blocked["action"] == "answer_directly"
+        assert allowed["action"] == "escalate_cloud_agent"
+    asyncio.run(run())
+
+
+def test_context_pipeline_cloud_escalation_feeds_summary_to_local_and_appends_report(tmp_path) -> None:
+    async def run() -> None:
+        local_provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=[
+                '{"action":"escalate_cloud_agent","query":"deep research Jason Kolios Greece","reason":"explicit"}',
+                "Jason Kolios has Greece-related evidence in the cloud report.",
+            ],
+        )
+        cloud_provider = PlainFakeProvider(
+            supports_tools=True,
+            responses=[
+                "summary: Jason Kolios is mentioned in Greece-related results.\n"
+                "key_points:\n- Greece evidence item\n"
+                "citations/evidence:\n- Example — https://example.com\n"
+                "full_report: Detailed cloud report about Jason Kolios Greece with citations.\n"
+                "limitations: Some uncertainty remains."
+            ],
+        )
+        cfg = AgentDefaults.model_validate({
+            "contextPipeline": {
+                "enableCloudEscalation": True,
+                "cloudEscalation": {
+                    "enabled": True,
+                    "providerPreset": "cloud-agent",
+                    "maxSummaryChars": 500,
+                    "maxReportChars": 80,
+                    "appendFullReport": True,
+                },
+            }
+        }).context_pipeline
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=local_provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=cfg,
+            preset_snapshot_loader=lambda name: ProviderSnapshot(
+                provider=cloud_provider,
+                model="openai/gpt-5-mini",
+                context_window_tokens=64000,
+                signature=("cloud", name),
+            ),
+        )
+
+        result = await loop._process_message(
+            InboundMessage(
+                channel="matrix",
+                sender_id="@u:s",
+                chat_id="room",
+                content="deep research Jason Kolios Greece",
+            )
+        )
+
+        assert result is not None
+        assert result.content.startswith("Short answer:\nJason Kolios has Greece-related evidence")
+        assert "Cloud report:\nDetailed cloud report about Jason Kolios Greece" in result.content
+        assert len(result.content.split("Cloud report:\n", 1)[1]) <= 81
+        assert len(cloud_provider.calls) == 1
+        assert cloud_provider.calls[0]["tools"] is None
+        local_final_prompt = "\n".join(
+            str(message.get("content", "")) for message in local_provider.calls[-1]["messages"]
+        )
+        assert "Cloud specialist summary:" in local_final_prompt
+        assert "Jason Kolios is mentioned" in local_final_prompt
+        assert "Key points/evidence:" in local_final_prompt
+        assert local_provider.calls[-1]["tools"] is None
+    asyncio.run(run())
+
+
+def test_context_pipeline_cloud_missing_key_and_return_direct(tmp_path) -> None:
+    async def run() -> None:
+        cfg = AgentDefaults.model_validate({
+            "contextPipeline": {
+                "enableCloudEscalation": True,
+                "cloudEscalation": {"enabled": True, "providerPreset": "cloud-agent"},
+            }
+        }).context_pipeline
+        missing_provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"escalate_cloud_agent","query":"deep research x","reason":"explicit"}'],
+        )
+        missing_loop = AgentLoop(
+            bus=MessageBus(),
+            provider=missing_provider,
+            workspace=tmp_path / "missing",
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=cfg,
+            preset_snapshot_loader=lambda name: (_ for _ in ()).throw(
+                ValueError("No API key configured for provider 'openrouter'.")
+            ),
+        )
+        missing_result = await missing_loop._process_message(
+            InboundMessage(channel="matrix", sender_id="@u:s", chat_id="room", content="deep research x")
+        )
+        assert missing_result is not None
+        assert missing_result.content == "Cloud escalation is configured, but the cloud provider API key is missing."
+
+        direct_cfg = AgentDefaults.model_validate({
+            "contextPipeline": {
+                "enableCloudEscalation": True,
+                "cloudEscalation": {
+                    "enabled": True,
+                    "returnCloudDirectly": True,
+                    "appendFullReport": False,
+                },
+            }
+        }).context_pipeline
+        direct_local = PlainFakeProvider(
+            supports_tools=False,
+            responses=['{"action":"escalate_cloud_agent","query":"deep research x","reason":"explicit"}'],
+        )
+        direct_cloud = PlainFakeProvider(supports_tools=True, responses=["summary: cloud answer\nfull_report: cloud report"])
+        direct_loop = AgentLoop(
+            bus=MessageBus(),
+            provider=direct_local,
+            workspace=tmp_path / "direct",
+            model="fake-small",
+            context_window_tokens=2048,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=direct_cfg,
+            preset_snapshot_loader=lambda name: ProviderSnapshot(
+                provider=direct_cloud,
+                model="openai/gpt-5-mini",
+                context_window_tokens=64000,
+                signature=("cloud", name),
+            ),
+        )
+        direct_result = await direct_loop._process_message(
+            InboundMessage(channel="matrix", sender_id="@u:s", chat_id="room2", content="deep research x")
+        )
+        assert direct_result is not None
+        assert direct_result.content == "summary: cloud answer\nfull_report: cloud report"
+        assert len(direct_local.calls) == 1
+        assert len(direct_cloud.calls) == 1
     asyncio.run(run())
 
 

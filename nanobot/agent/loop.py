@@ -1069,6 +1069,66 @@ class AgentLoop:
             return True
         return bool(re.fullmatch(r"\s*(?:yes|no|ok|okay|thanks|thank you)\s*[.!?]*\s*", text, flags=re.I))
 
+    def _context_pipeline_cloud_cfg(self) -> Any:
+        return getattr(self.context_pipeline, "cloud_escalation", None)
+
+    def _context_pipeline_cloud_enabled(self) -> bool:
+        cfg = self._context_pipeline_cloud_cfg()
+        return bool(self._context_pipeline_cfg("enable_cloud_escalation", False)) and bool(
+            getattr(cfg, "enabled", False)
+        )
+
+    def _context_pipeline_cloud_explicit_trigger(self, request: str) -> bool:
+        cfg = self._context_pipeline_cloud_cfg()
+        triggers = getattr(cfg, "explicit_triggers", None) or []
+        text = (request or "").casefold()
+        return any(str(trigger).strip().casefold() in text for trigger in triggers if str(trigger).strip())
+
+    @staticmethod
+    def _context_pipeline_cloud_heuristic_request(request: str) -> bool:
+        text = (request or "").casefold()
+        if not text:
+            return False
+        return bool(re.search(
+            r"\b(deep research|full report|research report|comprehensive report|"
+            r"multi[- ]source|broad synthesis|architecture review|complex architecture|"
+            r"complex coding|stronger reasoning|detailed report|investigate thoroughly)\b",
+            text,
+            flags=re.I,
+        ))
+
+    def _context_pipeline_cloud_action_allowed(self, request: str) -> bool:
+        if not self._context_pipeline_cloud_enabled():
+            return False
+        cfg = self._context_pipeline_cloud_cfg()
+        explicit = self._context_pipeline_cloud_explicit_trigger(request)
+        if bool(getattr(cfg, "require_explicit_trigger", False)) and not explicit:
+            return False
+        return True
+
+    def _context_pipeline_should_escalate_cloud(self, request: str) -> bool:
+        if not self._context_pipeline_cloud_action_allowed(request):
+            return False
+        return self._context_pipeline_cloud_explicit_trigger(request) or self._context_pipeline_cloud_heuristic_request(request)
+
+    def _context_pipeline_heuristic_plan_without_cloud(self, request: str) -> dict[str, Any]:
+        if self._looks_like_reminder_request(request):
+            parsed = self._parse_context_pipeline_cron_request(request)
+            return {
+                "action": "cron",
+                "query": parsed.get("reminder_text") or self._plain_chat_search_query(request),
+                "reason": "heuristic selected cron",
+                **parsed,
+            }
+        names = heuristic_tool_names(request)
+        if "web_search" in names:
+            return {
+                "action": "web_search",
+                "query": self._plain_chat_search_query(request),
+                "reason": "heuristic selected web_search",
+            }
+        return {"action": "answer_directly", "query": "", "reason": "heuristic direct answer"}
+
     @staticmethod
     def _looks_like_reminder_request(request: str) -> bool:
         return bool(re.search(
@@ -1106,6 +1166,12 @@ class AgentLoop:
                 "query": parsed.get("reminder_text") or self._plain_chat_search_query(request),
                 "reason": "heuristic selected cron",
                 **parsed,
+            }
+        if self._context_pipeline_should_escalate_cloud(request):
+            return {
+                "action": "escalate_cloud_agent",
+                "query": request.strip(),
+                "reason": "heuristic selected cloud escalation",
             }
         names = heuristic_tool_names(request)
         if "web_search" in names:
@@ -1244,6 +1310,7 @@ class AgentLoop:
             "- answer_directly: answer without external tools\n"
             "- web_search: search the web for current/external information\n"
             "- cron: schedule a reminder or recurring task\n"
+            "- escalate_cloud_agent: hand off complex research/reasoning to the configured cloud specialist\n"
             "- ask_clarifying: ask one short clarification question\n\n"
             "For cron, include reminder_text plus at (ISO datetime) or cron_expr and timezone. "
             "Never claim a reminder was scheduled via answer_directly. "
@@ -1252,7 +1319,7 @@ class AgentLoop:
             f"Recent chat history available: {'yes' if recent_chat_history_available else 'no'}\n\n"
             f"User request:\n{request}\n\n"
             "Return JSON only:\n"
-            '{"action":"answer_directly|web_search|cron|ask_clarifying","query":"...","reminder_text":"...","at":"...","cron_expr":"...","timezone":"...","reason":"..."}'
+            '{"action":"answer_directly|web_search|cron|escalate_cloud_agent|ask_clarifying","query":"...","reminder_text":"...","at":"...","cron_expr":"...","timezone":"...","reason":"..."}'
         )
         response = await self._plain_provider_chat(
             [{"role": "user", "content": prompt}],
@@ -1269,18 +1336,29 @@ class AgentLoop:
         if action == "schedule_reminder":
             action = "cron"
         heuristic: dict[str, Any] | None = None
-        if action not in {"answer_directly", "web_search", "cron", "ask_clarifying"}:
+        if action not in {"answer_directly", "web_search", "cron", "escalate_cloud_agent", "ask_clarifying"}:
             heuristic = self._context_pipeline_heuristic_plan(request)
             action = heuristic["action"]
         if action == "ask_clarifying":
             heuristic = heuristic or self._context_pipeline_heuristic_plan(request)
-            if heuristic.get("action") in {"web_search", "cron"}:
+            if heuristic.get("action") in {"web_search", "cron", "escalate_cloud_agent"}:
                 parsed = {**heuristic, **parsed, "action": heuristic["action"]}
                 action = str(heuristic["action"])
             elif recent_chat_history_available and self._context_pipeline_history_reference_request(request):
                 chat_history_cfg = self._context_pipeline_chat_history_cfg()
                 if chat_history_cfg is not None and bool(getattr(chat_history_cfg, "enabled", False)):
                     action = "answer_directly"
+        if action == "escalate_cloud_agent":
+            no_cloud_heuristic = self._context_pipeline_heuristic_plan_without_cloud(request)
+            if (
+                not self._context_pipeline_cloud_action_allowed(request)
+                or (
+                    no_cloud_heuristic.get("action") in {"web_search", "cron"}
+                    and not self._context_pipeline_cloud_explicit_trigger(request)
+                )
+            ):
+                action = str(no_cloud_heuristic.get("action") or "answer_directly")
+                parsed = {**no_cloud_heuristic, **parsed, "action": action}
         query = str(parsed.get("query") or "").strip()
         if action == "web_search" and not query:
             query = self._plain_chat_search_query(request)
@@ -1453,6 +1531,188 @@ class AgentLoop:
         logger.info("Context pipeline final evidence chars {}/{}", len(text), max_chars)
         return text
 
+    @staticmethod
+    def _extract_cloud_sections(text: str) -> dict[str, str]:
+        sections: dict[str, str] = {}
+        current = "full_report"
+        lines: list[str] = []
+        header_re = re.compile(r"^\s*(?:[-*]\s*)?(summary|key_points|key points|citations/evidence|citations|evidence|full_report|full report|limitations)\s*:?\s*(.*)$", re.I)
+        for raw in (text or "").splitlines():
+            match = header_re.match(raw)
+            if match:
+                if lines:
+                    sections[current] = "\n".join(lines).strip()
+                current = match.group(1).casefold().replace(" ", "_").replace("/", "_")
+                rest = match.group(2).strip()
+                lines = [rest] if rest else []
+                continue
+            lines.append(raw)
+        if lines:
+            sections[current] = "\n".join(lines).strip()
+        if not sections.get("summary"):
+            parsed = AgentLoop._parse_json_object(text)
+            if parsed:
+                for key in ("summary", "key_points", "citations", "evidence", "full_report", "limitations"):
+                    value = parsed.get(key)
+                    if isinstance(value, list):
+                        sections[key] = "\n".join(f"- {item}" for item in value)
+                    elif value is not None:
+                        sections[key] = str(value)
+        if not sections.get("full_report"):
+            sections["full_report"] = text.strip()
+        return sections
+
+    @staticmethod
+    def _truncate_context_pipeline_text(text: str, max_chars: int) -> str:
+        text = (text or "").strip()
+        if max_chars > 0 and len(text) > max_chars:
+            return text[: max(0, max_chars - 1)].rstrip() + "…"
+        return text
+
+    def _context_pipeline_cloud_history_text(self, history: list[dict[str, Any]], max_chars: int = 1200) -> str:
+        formatted = self._format_context_pipeline_chat_history([
+            {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
+            for item in history
+            if isinstance(item, dict)
+        ])
+        return self._truncate_context_pipeline_text(formatted, max_chars)
+
+    def _build_cloud_handoff_messages(self, request: str, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        history_text = self._context_pipeline_cloud_history_text(history)
+        prompt = (
+            f"User request:\n{request}\n\n"
+            "Recent conversation summary, if relevant:\n"
+            f"{history_text or 'No recent conversation provided.'}\n\n"
+            "Instructions:\n"
+            "Return this structure in plain text or JSON:\n"
+            "- summary: compact 5-10 sentence summary\n"
+            "- key_points: bullet list\n"
+            "- citations/evidence: titles + URLs if available\n"
+            "- full_report: detailed answer/report\n"
+            "- limitations: anything uncertain\n\n"
+            "Do not include secrets. Do not claim actions were performed unless actually performed."
+        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are a cloud specialist agent. Produce a structured research result "
+                    "for a small local assistant to use. Be concise but complete."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+    async def _run_context_pipeline_cloud(
+        self,
+        ctx: TurnContext,
+        plan: dict[str, Any],
+    ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        cfg = self._context_pipeline_cloud_cfg()
+        preset_name = str(getattr(cfg, "provider_preset", "cloud-agent") or "cloud-agent")
+        logger.info("Cloud escalation providerPreset={}", preset_name)
+        try:
+            snapshot = self._build_model_preset_snapshot(preset_name)
+        except Exception as exc:
+            message = str(exc)
+            if "api key" in message.casefold() or "not configured" in message.casefold():
+                final = "Cloud escalation is configured, but the cloud provider API key is missing."
+                messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+                return final, ["cloud_escalation"], messages, "completed", False
+            logger.exception("Cloud escalation failed before request; falling back to local")
+            if bool(getattr(cfg, "fallback_to_local", True)):
+                history = [item for item in ctx.history if isinstance(item, dict)] if self._context_pipeline_chat_history_enabled("answer_directly") else []
+                ctx.initial_messages = self._build_context_pipeline_direct_messages(ctx.msg.content, history)
+                return await self._run_plain_chat_direct(ctx)
+            final = "Cloud escalation failed."
+            messages = [{"role": "user", "content": ctx.msg.content}, {"role": "assistant", "content": final}]
+            return final, ["cloud_escalation"], messages, "completed", False
+
+        request = ctx.msg.content.strip()
+        cloud_messages = self._build_cloud_handoff_messages(request, ctx.history)
+        request_chars = sum(len(str(message.get("content") or "")) for message in cloud_messages)
+        logger.info("Cloud escalation request chars {}", request_chars)
+        try:
+            cloud_response = await asyncio.wait_for(
+                snapshot.provider.chat_with_retry(
+                    messages=cloud_messages,
+                    tools=None,
+                    model=snapshot.model,
+                    retry_mode=self.provider_retry_mode,
+                    on_retry_wait=ctx.on_retry_wait,
+                ),
+                timeout=max(1, int(getattr(cfg, "timeout_seconds", 90) or 90)),
+            )
+        except Exception:
+            logger.exception("Cloud escalation failed; falling back to local")
+            if bool(getattr(cfg, "fallback_to_local", True)):
+                history = [item for item in ctx.history if isinstance(item, dict)] if self._context_pipeline_chat_history_enabled("answer_directly") else []
+                ctx.initial_messages = self._build_context_pipeline_direct_messages(request, history)
+                return await self._run_plain_chat_direct(ctx)
+            final = "Cloud escalation failed."
+            messages = [{"role": "user", "content": request}, {"role": "assistant", "content": final}]
+            return final, ["cloud_escalation"], messages, "completed", False
+
+        raw_cloud = cloud_response.content or ""
+        sections = self._extract_cloud_sections(raw_cloud)
+        max_summary = int(getattr(cfg, "max_summary_chars", 1800) or 1800)
+        max_report = int(getattr(cfg, "max_report_chars", 8000) or 8000)
+        summary = self._truncate_context_pipeline_text(sections.get("summary") or raw_cloud, max_summary)
+        key_points = self._truncate_context_pipeline_text(
+            "\n".join(
+                part for part in (
+                    sections.get("key_points"),
+                    sections.get("citations_evidence") or sections.get("citations") or sections.get("evidence"),
+                    sections.get("limitations"),
+                )
+                if part
+            ),
+            max_summary,
+        )
+        report = self._truncate_context_pipeline_text(sections.get("full_report") or raw_cloud, max_report)
+        logger.info(
+            "Cloud escalation completed summary chars {} report chars {}",
+            len(summary),
+            len(report),
+        )
+        ctx.prompt_injection_tools_used.append("cloud_escalation")
+
+        if bool(getattr(cfg, "return_cloud_directly", False)):
+            final = raw_cloud
+            if bool(getattr(cfg, "append_full_report", True)) and report and report not in final:
+                final = f"{final}\n\nCloud report:\n{report}"
+            messages = list(cloud_messages)
+            messages.append({"role": "assistant", "content": final})
+            return final, list(ctx.prompt_injection_tools_used), messages, "completed", False
+
+        local_prompt = (
+            f"Original user request:\n{request}\n\n"
+            f"Cloud specialist summary:\n{summary}\n\n"
+            f"Key points/evidence:\n{key_points or 'No key points provided.'}\n\n"
+            "Write the short user-facing answer."
+        )
+        local_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise local assistant. A cloud specialist has completed research. "
+                    "Use the summary below to answer the user. Do not invent details."
+                ),
+            },
+            {"role": "user", "content": local_prompt},
+        ]
+        local_messages = self._trim_plain_chat_to_context(local_messages)
+        local_response = await self._plain_provider_chat(local_messages, on_retry_wait=ctx.on_retry_wait)
+        self._last_usage = dict(local_response.usage or {})
+        short_answer = local_response.content or EMPTY_FINAL_RESPONSE_MESSAGE
+        logger.info("Final local answer generated from cloud summary")
+        final = f"Short answer:\n{short_answer}"
+        if bool(getattr(cfg, "append_full_report", True)):
+            final = f"{final}\n\nCloud report:\n{report}"
+        all_messages = list(local_messages)
+        all_messages.append({"role": "assistant", "content": final})
+        return final, list(ctx.prompt_injection_tools_used), all_messages, "completed", False
+
     async def _run_context_pipeline_cron(
         self,
         ctx: TurnContext,
@@ -1565,6 +1825,8 @@ class AgentLoop:
             return final, [], messages, "completed", False
         if action == "cron":
             return await self._run_context_pipeline_cron(ctx, plan)
+        if action == "escalate_cloud_agent":
+            return await self._run_context_pipeline_cloud(ctx, plan)
         if action != "web_search":
             history = [item for item in ctx.history if isinstance(item, dict)] if self._context_pipeline_chat_history_enabled("answer_directly") else []
             ctx.initial_messages = self._build_context_pipeline_direct_messages(request, history)

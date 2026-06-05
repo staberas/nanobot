@@ -112,6 +112,31 @@ class ContextPipelineChatHistoryConfig(Base):
     )
 
 
+class CloudEscalationConfig(Base):
+    """Cloud specialist handoff settings for context-pipeline mode."""
+
+    enabled: bool = False
+    provider_preset: str = "cloud-agent"
+    mode: Literal["heuristic"] = "heuristic"
+    require_explicit_trigger: bool = False
+    explicit_triggers: list[str] = Field(
+        default_factory=lambda: [
+            "deep research",
+            "use cloud",
+            "ask cloud",
+            "agent mode",
+            "do a full report",
+            "full report",
+        ]
+    )
+    max_summary_chars: int = Field(default=1800, ge=1, le=10_000)
+    max_report_chars: int = Field(default=8000, ge=1, le=50_000)
+    append_full_report: bool = True
+    return_cloud_directly: bool = False
+    timeout_seconds: int = Field(default=90, ge=1, le=600)
+    fallback_to_local: bool = True
+
+
 class ContextPipelineConfig(Base):
     """Context-economy middleware settings for plain-chat tool execution."""
 
@@ -127,6 +152,8 @@ class ContextPipelineConfig(Base):
     default_reminder_time: str = "09:00"
     timezone: str | None = None
     debug: bool = False
+    enable_cloud_escalation: bool = False
+    cloud_escalation: CloudEscalationConfig = Field(default_factory=CloudEscalationConfig)
     chat_history: ContextPipelineChatHistoryConfig = Field(
         default_factory=ContextPipelineChatHistoryConfig
     )
@@ -315,6 +342,7 @@ class ProvidersConfig(Base):
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)
     openrouter: ProviderConfig = Field(default_factory=ProviderConfig)
+    perplexity: ProviderConfig = Field(default_factory=ProviderConfig)
     huggingface: ProviderConfig = Field(default_factory=ProviderConfig)
     skywork: ProviderConfig = Field(default_factory=ProviderConfig)  # Skywork / APIFree API gateway
     deepseek: ProviderConfig = Field(default_factory=ProviderConfig)

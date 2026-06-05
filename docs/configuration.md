@@ -1105,6 +1105,19 @@ without chat history, skills, or tool schemas:
         "defaultReminderTime": "09:00",
         "timezone": "Europe/Athens",
         "debug": false,
+        "enableCloudEscalation": true,
+        "cloudEscalation": {
+          "enabled": true,
+          "providerPreset": "cloud-agent",
+          "mode": "heuristic",
+          "requireExplicitTrigger": false,
+          "explicitTriggers": ["deep research", "use cloud", "ask cloud", "agent mode", "do a full report"],
+          "maxSummaryChars": 1800,
+          "maxReportChars": 8000,
+          "appendFullReport": true,
+          "returnCloudDirectly": false,
+          "timeoutSeconds": 90
+        },
         "chatHistory": {
           "enabled": true,
           "maxTurns": 4,
@@ -1120,6 +1133,20 @@ without chat history, skills, or tool schemas:
         "allow": ["web_search", "web_fetch", "cron"],
         "deny": ["apply_patch", "run_cli_app", "edit_file", "read_file", "write_file"]
       }
+    },
+    "cloud-agent": {
+      "provider": "openrouter",
+      "model": "openai/gpt-5-mini",
+      "contextWindowTokens": 64000,
+      "maxTokens": 4096,
+      "temperature": 0.2
+    },
+    "cloud-research": {
+      "provider": "perplexity",
+      "model": "sonar-pro",
+      "contextWindowTokens": 16000,
+      "maxTokens": 2048,
+      "temperature": 0.2
     }
   },
   "memory": {
@@ -1147,10 +1174,25 @@ without chat history, skills, or tool schemas:
 | `defaultReminderTime` | `"09:00"` | Default HH:MM used for phrases such as `every morning` or date-only reminders. |
 | `timezone` | `null` | Optional IANA timezone for context-pipeline reminders, for example `Europe/Athens`; falls back to the agent timezone or UTC. |
 | `debug` | `false` | Reserved for additional pipeline diagnostics. |
+| `enableCloudEscalation` | `false` | Enables optional cloud handoff from context-pipeline while keeping the default provider local. |
+| `cloudEscalation.providerPreset` | `"cloud-agent"` | Agent/model preset used for the cloud specialist call, for example an OpenRouter or Perplexity preset. |
+| `cloudEscalation.requireExplicitTrigger` | `false` | When true, only phrases in `explicitTriggers` can escalate. |
+| `cloudEscalation.maxSummaryChars` / `maxReportChars` | `1800` / `8000` | Caps the compact summary fed back to the local model and the appended full report. |
+| `cloudEscalation.appendFullReport` | `true` | Append the trimmed cloud report below the local RKLLAMA-facing answer. |
+| `cloudEscalation.returnCloudDirectly` | `false` | Skip the final local pass and return the cloud output directly. |
 
 Configure web search under [`tools.web.search`](#toolswebsearch). The pipeline does not
 persist raw search results or fetched page text into session history; it saves only the
 normal user-visible turn.
+
+Cloud escalation is opt-in and does not change local-first defaults: keep
+`agents.defaults.provider` set to `rkllama`, then add cloud presets such as
+`agents.cloud-agent` or `agents.cloud-research`. Store credentials in environment or
+Kubernetes Secrets (`OPENROUTER_API_KEY`, `PERPLEXITY_API_KEY`) rather than config JSON.
+Casual chat, reminders, and normal `search X` prompts remain local; explicit triggers such
+as `deep research` or complex report requests can hand off to the configured cloud preset.
+The cloud summary is passed back to RKLLAMA for the short user-facing answer unless
+`returnCloudDirectly` is enabled.
 
 For ordinary direct chat, `contextPipeline.chatHistory` adds a compact recent
 conversation window only to final direct-answer/clarification prompts. Planner, reducer,
