@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,12 +43,14 @@ def _make_provider_core(
     p = config.get_provider(model, preset=resolved)
     spec = find_by_name(provider_name) if provider_name else None
     backend = spec.backend if spec else "openai_compat"
+    env_api_key = os.environ.get(spec.env_key) if spec and spec.env_key else None
+    api_key = (p.api_key if p else None) or env_api_key
 
     if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
+        if not p or not api_key or not p.api_base:
             raise ValueError("Azure OpenAI requires api_key and api_base in config.")
     elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
+        needs_key = not api_key
         exempt = (spec and (spec.is_oauth or spec.is_local or spec.is_direct)) or (p and p.api_base)
         if needs_key and not exempt:
             raise ValueError(f"No API key configured for provider '{provider_name}'.")
@@ -60,7 +63,7 @@ def _make_provider_core(
         from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
 
         provider = AzureOpenAIProvider(
-            api_key=p.api_key,
+            api_key=api_key,
             api_base=p.api_base,
             default_model=model,
         )
@@ -72,7 +75,7 @@ def _make_provider_core(
         from nanobot.providers.anthropic_provider import AnthropicProvider
 
         provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
+            api_key=api_key,
             api_base=config.get_api_base(model, preset=resolved),
             default_model=model,
             extra_headers=p.extra_headers if p else None,
@@ -81,7 +84,7 @@ def _make_provider_core(
         from nanobot.providers.bedrock_provider import BedrockProvider
 
         provider = BedrockProvider(
-            api_key=p.api_key if p else None,
+            api_key=api_key,
             api_base=p.api_base if p else None,
             default_model=model,
             region=getattr(p, "region", None) if p else None,
@@ -92,7 +95,7 @@ def _make_provider_core(
         from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 
         provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
+            api_key=api_key,
             api_base=config.get_api_base(model, preset=resolved),
             default_model=model,
             extra_headers=p.extra_headers if p else None,

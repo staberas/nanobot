@@ -10,10 +10,9 @@ from typer.testing import CliRunner
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.cli.commands import app
-from nanobot.providers.factory import make_provider
 from nanobot.config.schema import Config
 from nanobot.cron.types import CronJob, CronPayload
-from nanobot.providers.factory import ProviderSnapshot
+from nanobot.providers.factory import ProviderSnapshot, make_provider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_name
 
@@ -542,8 +541,8 @@ def test_openai_compat_provider_passes_model_through():
 
 
 def test_make_provider_uses_github_copilot_backend():
-    from nanobot.providers.factory import make_provider
     from nanobot.config.schema import Config
+    from nanobot.providers.factory import make_provider
 
     config = Config.model_validate(
         {
@@ -1316,6 +1315,32 @@ def test_gateway_cron_evaluator_receives_scheduled_reminder_context(
             "_channel_delivery": True,
         }
     ]
+
+    bus.publish_outbound.reset_mock()
+    direct_job = CronJob(
+        id="cron-2",
+        name="cluster",
+        payload=CronPayload(
+            message="check the cluster",
+            deliver=True,
+            channel="matrix",
+            to="!room:s",
+            channel_meta={"_context_pipeline_reminder": True},
+            session_key="matrix:!room:s",
+        ),
+    )
+
+    direct_response = asyncio.run(cron.on_job(direct_job))
+
+    assert direct_response == "Reminder: check the cluster"
+    bus.publish_outbound.assert_awaited_once_with(
+        OutboundMessage(
+            channel="matrix",
+            chat_id="!room:s",
+            content="Reminder: check the cluster",
+            metadata={"_context_pipeline_reminder": True},
+        )
+    )
 
 
 def test_gateway_cron_job_suppresses_intermediate_progress(

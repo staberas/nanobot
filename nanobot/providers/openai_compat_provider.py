@@ -376,6 +376,10 @@ class OpenAICompatProvider(LLMProvider):
     def supports_configured_tool_calls(self) -> bool:
         return self._capability("tools", True)
 
+    def supports_tools(self) -> bool:
+        """Honor provider capability overrides when routing turns."""
+        return self.supports_configured_tool_calls
+
     def _build_client(self) -> None:
         """Create the OpenAI client using the current module-level AsyncOpenAI."""
         import httpx
@@ -1031,6 +1035,11 @@ class OpenAICompatProvider(LLMProvider):
                         reasoning_content=reasoning_content,
                         finish_reason=str(response_map.get("finish_reason") or "stop"),
                         usage=self._extract_usage(response_map),
+                        provider_metadata={
+                            key: response_map.get(key)
+                            for key in ("citations", "references", "search_results")
+                            if key in response_map
+                        },
                     )
                 return LLMResponse(content="Error: API returned empty choices.", finish_reason="error")
 
@@ -1082,6 +1091,11 @@ class OpenAICompatProvider(LLMProvider):
                 finish_reason=finish_reason,
                 usage=self._extract_usage(response_map),
                 reasoning_content=reasoning_content if isinstance(reasoning_content, str) else None,
+                provider_metadata={
+                    key: response_map.get(key)
+                    for key in ("citations", "references", "search_results")
+                    if key in response_map
+                },
             )
 
         if not response.choices:
@@ -1129,6 +1143,11 @@ class OpenAICompatProvider(LLMProvider):
             finish_reason=finish_reason or "stop",
             usage=self._extract_usage(response),
             reasoning_content=reasoning_content,
+            provider_metadata={
+                key: getattr(response, key)
+                for key in ("citations", "references", "search_results")
+                if getattr(response, key, None) is not None
+            },
         )
 
     @classmethod
