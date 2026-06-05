@@ -528,7 +528,17 @@ class MatrixChannel(BaseChannel):
                         failures.append(fail)
             if failures:
                 text = f"{text.rstrip()}\n{chr(10).join(failures)}" if text.strip() else "\n".join(failures)
-            if text.strip():
+            chunks = (msg.metadata or {}).get("matrix_chunks")
+            if isinstance(chunks, list) and chunks:
+                for chunk in chunks:
+                    chunk_text = str(chunk or "").strip()
+                    if not chunk_text:
+                        continue
+                    content = _build_matrix_text_content(chunk_text)
+                    if relates_to:
+                        content["m.relates_to"] = relates_to
+                    await self._send_room_content(msg.chat_id, content)
+            elif text.strip():
                 content = _build_matrix_text_content(text)
                 if relates_to:
                     content["m.relates_to"] = relates_to

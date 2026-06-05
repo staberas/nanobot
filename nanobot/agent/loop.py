@@ -1532,34 +1532,77 @@ class AgentLoop:
         return text
 
     @staticmethod
+    def _canonical_cloud_section(name: str) -> str:
+        normalized = name.casefold().replace(" ", "_").replace("/", "_").replace("-", "_")
+        aliases = {
+            "key_points": "key_points",
+            "citations_evidence": "sources",
+            "citations": "sources",
+            "evidence": "sources",
+            "source": "sources",
+            "sources": "sources",
+            "full_report": "full_report",
+            "report": "full_report",
+            "details": "full_report",
+            "detailed_answer": "full_report",
+            "limitations": "limitations",
+            "summary": "summary",
+        }
+        return aliases.get(normalized, normalized)
+
+    @staticmethod
     def _extract_cloud_sections(text: str) -> dict[str, str]:
+        raw_text = (text or "").replace("\r\n", "\n").strip()
+        if not raw_text:
+            return {"summary": "", "full_report": "", "sources": ""}
+        parsed = AgentLoop._parse_json_object(raw_text)
+        if parsed:
+            sections: dict[str, str] = {}
+            for key, value in parsed.items():
+                canonical = AgentLoop._canonical_cloud_section(str(key))
+                if isinstance(value, list):
+                    sections[canonical] = "\n".join(f"- {item}" for item in value if str(item).strip())
+                elif value is not None:
+                    sections[canonical] = str(value).strip()
+            sections.setdefault("full_report", raw_text)
+            sections.setdefault("summary", sections.get("full_report", ""))
+            sections.setdefault("sources", "")
+            return sections
+
+        header_re = re.compile(
+            r"^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?"
+            r"(summary|key[_ -]?points|citations\s*/\s*evidence|citations|evidence|sources?|"
+            r"full[_ -]?report|report|details|detailed[_ -]?answer|limitations)"
+            r"\s*:\s*(.*)$",
+            re.I,
+        )
         sections: dict[str, str] = {}
         current = "full_report"
         lines: list[str] = []
-        header_re = re.compile(r"^\s*(?:[-*]\s*)?(summary|key_points|key points|citations/evidence|citations|evidence|full_report|full report|limitations)\s*:?\s*(.*)$", re.I)
-        for raw in (text or "").splitlines():
+        saw_header = False
+        for raw in raw_text.splitlines():
             match = header_re.match(raw)
             if match:
-                if lines:
-                    sections[current] = "\n".join(lines).strip()
-                current = match.group(1).casefold().replace(" ", "_").replace("/", "_")
+                if lines or saw_header:
+                    existing = sections.get(current, "")
+                    block = "\n".join(lines).strip()
+                    if block:
+                        sections[current] = f"{existing}\n{block}".strip() if existing else block
+                current = AgentLoop._canonical_cloud_section(match.group(1))
                 rest = match.group(2).strip()
                 lines = [rest] if rest else []
+                saw_header = True
                 continue
-            lines.append(raw)
-        if lines:
-            sections[current] = "\n".join(lines).strip()
-        if not sections.get("summary"):
-            parsed = AgentLoop._parse_json_object(text)
-            if parsed:
-                for key in ("summary", "key_points", "citations", "evidence", "full_report", "limitations"):
-                    value = parsed.get(key)
-                    if isinstance(value, list):
-                        sections[key] = "\n".join(f"- {item}" for item in value)
-                    elif value is not None:
-                        sections[key] = str(value)
-        if not sections.get("full_report"):
-            sections["full_report"] = text.strip()
+            lines.append(raw.rstrip())
+        block = "\n".join(lines).strip()
+        if block:
+            existing = sections.get(current, "")
+            sections[current] = f"{existing}\n{block}".strip() if existing else block
+        if not saw_header:
+            sections["full_report"] = raw_text
+        sections.setdefault("full_report", raw_text)
+        sections.setdefault("summary", sections.get("full_report", ""))
+        sections.setdefault("sources", "")
         return sections
 
     @staticmethod
@@ -1568,6 +1611,59 @@ class AgentLoop:
         if max_chars > 0 and len(text) > max_chars:
             return text[: max(0, max_chars - 1)].rstrip() + "…"
         return text
+
+    @staticmethod
+    def _truncate_cloud_report(text: str, max_chars: int) -> str:
+        text = (text or "").strip()
+        if max_chars > 0 and len(text) > max_chars:
+            note = "\n\n[report truncated]"
+            return text[: max(0, max_chars - len(note))].rstrip() + note
+        return text
+
+    @staticmethod
+    def _clean_local_cloud_answer(text: str) -> str:
+        cleaned = (text or "").strip()
+        cleaned = re.sub(r"^\s*(?:short\s+answer|answer|summary)\s*:\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"^\s*details(?=[A-Z])", "", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _extract_cloud_sources(sections: dict[str, str], metadata: dict[str, Any] | None = None) -> list[str]:
+        sources: list[str] = []
+
+        def add_source(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, dict):
+                title = str(value.get("title") or value.get("name") or "").strip()
+                url = str(value.get("url") or value.get("link") or value.get("source") or "").strip()
+                text = f"{title} — {url}" if title and url else (url or title)
+            else:
+                text = str(value).strip()
+            if text and not any(text == existing or text in existing or existing in text for existing in sources):
+                sources.append(text)
+
+        for key in ("citations", "references", "search_results"):
+            value = (metadata or {}).get(key)
+            if isinstance(value, list):
+                for item in value:
+                    add_source(item)
+            else:
+                add_source(value)
+        source_text = sections.get("sources") or ""
+        for line in source_text.splitlines():
+            line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            add_source(line)
+        combined = "\n".join(str(value or "") for value in sections.values())
+        for url in re.findall(r"https?://[^\s)\]>}]+", combined):
+            add_source(url.rstrip(".,;"))
+        return sources
+
+    @staticmethod
+    def _format_cloud_sources(sources: list[str]) -> str:
+        if not sources:
+            return ""
+        return "Sources:\n" + "\n".join(f"{idx}. {source}" for idx, source in enumerate(sources, 1))
 
     def _context_pipeline_cloud_history_text(self, history: list[dict[str, Any]], max_chars: int = 1200) -> str:
         formatted = self._format_context_pipeline_chat_history([
@@ -1588,9 +1684,12 @@ class AgentLoop:
             "- summary: compact 5-10 sentence summary\n"
             "- key_points: bullet list\n"
             "- citations/evidence: titles + URLs if available\n"
+            "- sources: direct URLs with titles when available\n"
             "- full_report: detailed answer/report\n"
             "- limitations: anything uncertain\n\n"
-            "Do not include secrets. Do not claim actions were performed unless actually performed."
+            "Include a Sources section with direct URLs. Do not use citation numbers without "
+            "listing the corresponding URLs. Do not include secrets. Do not claim actions were "
+            "performed unless actually performed."
         )
         return [
             {
@@ -1655,21 +1754,23 @@ class AgentLoop:
 
         raw_cloud = cloud_response.content or ""
         sections = self._extract_cloud_sections(raw_cloud)
-        max_summary = int(getattr(cfg, "max_summary_chars", 1800) or 1800)
-        max_report = int(getattr(cfg, "max_report_chars", 8000) or 8000)
+        max_summary = int(getattr(cfg, "max_summary_chars", 2500) or 2500)
+        max_report = int(getattr(cfg, "max_report_chars", 16000) or 16000)
         summary = self._truncate_context_pipeline_text(sections.get("summary") or raw_cloud, max_summary)
+        sources = self._extract_cloud_sources(sections, cloud_response.provider_metadata)
+        source_block = self._format_cloud_sources(sources)
         key_points = self._truncate_context_pipeline_text(
             "\n".join(
                 part for part in (
                     sections.get("key_points"),
-                    sections.get("citations_evidence") or sections.get("citations") or sections.get("evidence"),
+                    source_block,
                     sections.get("limitations"),
                 )
                 if part
             ),
             max_summary,
         )
-        report = self._truncate_context_pipeline_text(sections.get("full_report") or raw_cloud, max_report)
+        report = self._truncate_cloud_report(sections.get("full_report") or raw_cloud, max_report)
         logger.info(
             "Cloud escalation completed summary chars {} report chars {}",
             len(summary),
@@ -1678,7 +1779,9 @@ class AgentLoop:
         ctx.prompt_injection_tools_used.append("cloud_escalation")
 
         if bool(getattr(cfg, "return_cloud_directly", False)):
-            final = raw_cloud
+            final = raw_cloud.strip()
+            if source_block and "sources:" not in final.casefold():
+                final = f"{final}\n\n{source_block}"
             if bool(getattr(cfg, "append_full_report", True)) and report and report not in final:
                 final = f"{final}\n\nCloud report:\n{report}"
             messages = list(cloud_messages)
@@ -1704,11 +1807,13 @@ class AgentLoop:
         local_messages = self._trim_plain_chat_to_context(local_messages)
         local_response = await self._plain_provider_chat(local_messages, on_retry_wait=ctx.on_retry_wait)
         self._last_usage = dict(local_response.usage or {})
-        short_answer = local_response.content or EMPTY_FINAL_RESPONSE_MESSAGE
+        short_answer = self._clean_local_cloud_answer(local_response.content or EMPTY_FINAL_RESPONSE_MESSAGE)
         logger.info("Final local answer generated from cloud summary")
         final = f"Short answer:\n{short_answer}"
         if bool(getattr(cfg, "append_full_report", True)):
             final = f"{final}\n\nCloud report:\n{report}"
+            if source_block:
+                final = f"{final}\n\n{source_block}"
         all_messages = list(local_messages)
         all_messages.append({"role": "assistant", "content": final})
         return final, list(ctx.prompt_injection_tools_used), all_messages, "completed", False
@@ -2609,6 +2714,56 @@ class AgentLoop:
         )
         return ctx.outbound
 
+    @staticmethod
+    def _split_text_chunks(text: str, max_chars: int) -> list[str]:
+        text = text.strip()
+        if not text or len(text) <= max_chars:
+            return [text] if text else []
+        chunks: list[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining) <= max_chars:
+                chunks.append(remaining.strip())
+                break
+            split_at = remaining.rfind("\n\n", 0, max_chars + 1)
+            if split_at < max_chars // 2:
+                split_at = remaining.rfind("\n", 0, max_chars + 1)
+            if split_at < max_chars // 2:
+                split_at = max_chars
+            chunks.append(remaining[:split_at].strip())
+            remaining = remaining[split_at:].strip()
+        return [chunk for chunk in chunks if chunk]
+
+    def _cloud_escalation_outbound_chunks(self, final_content: str) -> list[str]:
+        cfg = self._context_pipeline_cloud_cfg()
+        if not bool(getattr(cfg, "split_long_reports", True)):
+            return []
+        if "Cloud report:\n" not in final_content:
+            return []
+        try:
+            max_chars = max(500, int(getattr(cfg, "matrix_chunk_chars", 3500) or 3500))
+        except (TypeError, ValueError):
+            max_chars = 3500
+        if len(final_content) <= max_chars:
+            return []
+        before_report, report_and_sources = final_content.split("Cloud report:\n", 1)
+        sources = ""
+        report = report_and_sources
+        if "\n\nSources:\n" in report_and_sources:
+            report, sources = report_and_sources.split("\n\nSources:\n", 1)
+            sources = "Sources:\n" + sources.strip()
+        chunks = [before_report.strip()]
+        report_chunk_budget = max(100, max_chars - 32)
+        report_chunks = self._split_text_chunks(report, report_chunk_budget)
+        total_parts = len(report_chunks)
+        chunks.extend(
+            f"Cloud report (part {idx}/{total_parts}):\n{chunk}"
+            for idx, chunk in enumerate(report_chunks, 1)
+        )
+        if sources:
+            chunks.extend(self._split_text_chunks(sources, max_chars))
+        return [chunk for chunk in chunks if chunk]
+
     def _assemble_outbound(
         self,
         msg: InboundMessage,
@@ -2634,6 +2789,9 @@ class AgentLoop:
             meta["_streamed"] = True
         if turn_latency_ms is not None:
             meta["latency_ms"] = int(turn_latency_ms)
+        cloud_chunks = self._cloud_escalation_outbound_chunks(final_content)
+        if cloud_chunks:
+            meta["matrix_chunks"] = cloud_chunks
 
         return OutboundMessage(
             channel=msg.channel,

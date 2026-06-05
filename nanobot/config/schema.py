@@ -129,11 +129,13 @@ class CloudEscalationConfig(Base):
             "full report",
         ]
     )
-    max_summary_chars: int = Field(default=1800, ge=1, le=10_000)
-    max_report_chars: int = Field(default=8000, ge=1, le=50_000)
+    max_summary_chars: int = Field(default=2500, ge=1, le=10_000)
+    max_report_chars: int = Field(default=16000, ge=1, le=50_000)
     append_full_report: bool = True
     return_cloud_directly: bool = False
     timeout_seconds: int = Field(default=90, ge=1, le=600)
+    split_long_reports: bool = True
+    matrix_chunk_chars: int = Field(default=3500, ge=500, le=20_000)
     fallback_to_local: bool = True
 
 

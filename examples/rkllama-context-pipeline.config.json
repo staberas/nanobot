@@ -28,11 +28,13 @@
           "mode": "heuristic",
           "requireExplicitTrigger": false,
           "explicitTriggers": ["deep research", "use cloud", "ask cloud", "agent mode", "do a full report"],
-          "maxSummaryChars": 1800,
-          "maxReportChars": 8000,
+          "maxSummaryChars": 2500,
+          "maxReportChars": 16000,
           "appendFullReport": true,
           "returnCloudDirectly": false,
-          "timeoutSeconds": 90
+          "timeoutSeconds": 90,
+          "splitLongReports": true,
+          "matrixChunkChars": 3500
         },
         "chatHistory": {
           "enabled": true,

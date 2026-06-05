@@ -1112,11 +1112,13 @@ without chat history, skills, or tool schemas:
           "mode": "heuristic",
           "requireExplicitTrigger": false,
           "explicitTriggers": ["deep research", "use cloud", "ask cloud", "agent mode", "do a full report"],
-          "maxSummaryChars": 1800,
-          "maxReportChars": 8000,
+          "maxSummaryChars": 2500,
+          "maxReportChars": 16000,
           "appendFullReport": true,
           "returnCloudDirectly": false,
-          "timeoutSeconds": 90
+          "timeoutSeconds": 90,
+          "splitLongReports": true,
+          "matrixChunkChars": 3500
         },
         "chatHistory": {
           "enabled": true,
@@ -1177,9 +1179,10 @@ without chat history, skills, or tool schemas:
 | `enableCloudEscalation` | `false` | Enables optional cloud handoff from context-pipeline while keeping the default provider local. |
 | `cloudEscalation.providerPreset` | `"cloud-agent"` | Agent/model preset used for the cloud specialist call, for example an OpenRouter or Perplexity preset. |
 | `cloudEscalation.requireExplicitTrigger` | `false` | When true, only phrases in `explicitTriggers` can escalate. |
-| `cloudEscalation.maxSummaryChars` / `maxReportChars` | `1800` / `8000` | Caps the compact summary fed back to the local model and the appended full report. |
+| `cloudEscalation.maxSummaryChars` / `maxReportChars` | `2500` / `16000` | Caps the compact summary fed back to the local model and the appended full report. |
 | `cloudEscalation.appendFullReport` | `true` | Append the trimmed cloud report below the local RKLLAMA-facing answer. |
 | `cloudEscalation.returnCloudDirectly` | `false` | Skip the final local pass and return the cloud output directly. |
+| `cloudEscalation.splitLongReports` / `matrixChunkChars` | `true` / `3500` | Split long Matrix cloud reports into a short-answer message, report parts, and sources. |
 
 Configure web search under [`tools.web.search`](#toolswebsearch). The pipeline does not
 persist raw search results or fetched page text into session history; it saves only the

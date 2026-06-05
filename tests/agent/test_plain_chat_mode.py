@@ -506,7 +506,7 @@ def test_context_pipeline_cloud_escalation_feeds_summary_to_local_and_appends_re
             supports_tools=False,
             responses=[
                 '{"action":"escalate_cloud_agent","query":"deep research Jason Kolios Greece","reason":"explicit"}',
-                "Jason Kolios has Greece-related evidence in the cloud report.",
+                "detailsFor Jason Kolios has Greece-related evidence in the cloud report.",
             ],
         )
         cloud_provider = PlainFakeProvider(
@@ -558,9 +558,12 @@ def test_context_pipeline_cloud_escalation_feeds_summary_to_local_and_appends_re
         )
 
         assert result is not None
-        assert result.content.startswith("Short answer:\nJason Kolios has Greece-related evidence")
+        assert result.content.startswith("Short answer:\nFor Jason Kolios has Greece-related evidence")
+        assert "detailsFor" not in result.content
         assert "Cloud report:\nDetailed cloud report about Jason Kolios Greece" in result.content
-        assert len(result.content.split("Cloud report:\n", 1)[1]) <= 81
+        report_section = result.content.split("Cloud report:\n", 1)[1].split("\n\nSources:", 1)[0]
+        assert len(report_section) <= 81
+        assert "Sources:\n1. Example — https://example.com" in result.content
         assert len(cloud_provider.calls) == 1
         assert cloud_provider.calls[0]["tools"] is None
         local_final_prompt = "\n".join(
@@ -569,8 +572,64 @@ def test_context_pipeline_cloud_escalation_feeds_summary_to_local_and_appends_re
         assert "Cloud specialist summary:" in local_final_prompt
         assert "Jason Kolios is mentioned" in local_final_prompt
         assert "Key points/evidence:" in local_final_prompt
+        assert "Detailed cloud report about Jason Kolios" not in local_final_prompt
         assert local_provider.calls[-1]["tools"] is None
     asyncio.run(run())
+
+
+def test_context_pipeline_cloud_parser_sources_truncation_and_chunks(tmp_path) -> None:
+    sample = (
+        "Summary:\nFor RK3588, Ollama is mature.\n\n"
+        "Key points:\n- Ollama uses llama.cpp.\n\n"
+        "Full report:\n"
+        "This is a detailed report with enough text to split across Matrix chunks. "
+        "It preserves whitespace and should not merge headings into detailsFor artifacts.\n\n"
+        "Sources:\n"
+        "- Ollama docs — https://ollama.com/docs\n"
+        "- RKLLAMA project — https://example.com/rkllama"
+    )
+    sections = AgentLoop._extract_cloud_sections(sample)
+
+    assert sections["summary"] == "For RK3588, Ollama is mature."
+    assert sections["full_report"].startswith("This is a detailed report")
+    assert "detailsFor" not in sections["summary"]
+    sources = AgentLoop._extract_cloud_sources(sections)
+    assert "Ollama docs — https://ollama.com/docs" in sources
+    assert "RKLLAMA project — https://example.com/rkllama" in sources
+
+    truncated = AgentLoop._truncate_cloud_report("A" * 120, 40)
+    assert truncated.endswith("[report truncated]")
+    assert len(truncated) <= 40
+
+    cfg = AgentDefaults.model_validate({
+        "contextPipeline": {
+            "enableCloudEscalation": True,
+            "cloudEscalation": {
+                "enabled": True,
+                "splitLongReports": True,
+                "matrixChunkChars": 500,
+            },
+        }
+    }).context_pipeline
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=PlainFakeProvider(supports_tools=False),
+        workspace=tmp_path,
+        model="fake-small",
+        context_window_tokens=2048,
+        plain_chat_when_tools_unsupported=True,
+        tool_execution_mode="context_pipeline",
+        context_pipeline=cfg,
+    )
+    long_report = "Paragraph.\n\n" + ("Long cloud report text. " * 80)
+    final = f"Short answer:\nLocal answer.\n\nCloud report:\n{long_report}\n\nSources:\n1. https://example.com"
+    chunks = loop._cloud_escalation_outbound_chunks(final)
+
+    assert len(chunks) > 1
+    assert chunks[0] == "Short answer:\nLocal answer."
+    assert any(chunk.startswith("Cloud report (part") for chunk in chunks[1:])
+    assert chunks[-1].startswith("Sources:")
+    assert all(len(chunk) <= 500 for chunk in chunks)
 
 
 def test_context_pipeline_cloud_missing_key_and_return_direct(tmp_path) -> None:
