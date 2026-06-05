@@ -1,10 +1,10 @@
 """Tests for the Dream class — two-phase memory consolidation via AgentRunner."""
 
+import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from nanobot.agent.memory import Dream, MemoryStore
 from nanobot.agent.runner import AgentRunResult
@@ -157,7 +157,6 @@ class TestDreamRun:
         call_args = mock_provider.chat_with_retry.call_args
         user_msg = call_args.kwargs.get("messages", call_args[1].get("messages"))[1]["content"]
         # The ← suffix should only appear in MEMORY.md section
-        memory_section = user_msg.split("## Current MEMORY.md")[1].split("## Current SOUL.md")[0]
         soul_section = user_msg.split("## Current SOUL.md")[1].split("## Current USER.md")[0]
         user_section = user_msg.split("## Current USER.md")[1]
         # SOUL and USER should not contain age arrows
@@ -307,3 +306,53 @@ class TestDreamPromptCaps:
         history_section = user_msg.split("## Conversation History\n")[1].split("\n\n## Current Date")[0]
         assert len(history_section) < dream._HISTORY_ENTRY_PREVIEW_MAX_CHARS + 500
 
+
+
+class TestDreamToollessProvider:
+    def test_plain_chat_fallback_updates_memory_without_runner(self, store, mock_provider, mock_runner):
+        async def run() -> None:
+            store.append_history("User wants RKLLAMA reminders in Europe/Athens")
+            mock_provider.supports_tools = MagicMock(return_value=False)
+            mock_provider.chat_with_retry.return_value = MagicMock(
+                content="- User uses RKLLAMA reminders in Europe/Athens."
+            )
+            d = Dream(
+                store=store,
+                provider=mock_provider,
+                model="test-model",
+                plain_chat_fallback=True,
+            )
+            d._runner = mock_runner
+
+            result = await d.run()
+
+            assert result is True
+            mock_runner.run.assert_not_called()
+            assert "RKLLAMA reminders" in store.read_memory()
+            assert store.get_last_dream_cursor() == 1
+            call = mock_provider.chat_with_retry.call_args.kwargs
+            assert call["tools"] is None
+            assert call["tool_choice"] is None
+        asyncio.run(run())
+
+    def test_skips_when_tools_unsupported_and_plain_backend_disabled(
+        self, store, mock_provider, mock_runner
+    ):
+        async def run() -> None:
+            store.append_history("remember this later")
+            mock_provider.supports_tools = MagicMock(return_value=False)
+            d = Dream(
+                store=store,
+                provider=mock_provider,
+                model="test-model",
+                plain_chat_fallback=False,
+            )
+            d._runner = mock_runner
+
+            result = await d.run()
+
+            assert result is False
+            mock_provider.chat_with_retry.assert_not_called()
+            mock_runner.run.assert_not_called()
+            assert store.get_last_dream_cursor() == 0
+        asyncio.run(run())
