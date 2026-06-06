@@ -149,6 +149,16 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         supports_prompt_caching=True,
         gateway_reasoning_style="reasoning_effort",
     ),
+    # Perplexity Sonar: OpenAI-compatible chat completions endpoint.
+    ProviderSpec(
+        name="perplexity",
+        keywords=("perplexity", "sonar"),
+        env_key="PERPLEXITY_API_KEY",
+        display_name="Perplexity",
+        backend="openai_compat",
+        detect_by_base_keyword="perplexity.ai",
+        default_api_base="https://api.perplexity.ai",
+    ),
     # Hugging Face Inference Providers: OpenAI-compatible router for chat models.
     ProviderSpec(
         name="huggingface",

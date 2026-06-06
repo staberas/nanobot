@@ -62,6 +62,7 @@ class LLMResponse:
     error_code: str | None = None  # Provider/code semantic, e.g. rate_limit_exceeded.
     error_retry_after_s: float | None = None
     error_should_retry: bool | None = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:
@@ -168,6 +169,10 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+
+    def supports_tools(self) -> bool:
+        """Return whether this provider should be routed through the tool loop."""
+        return bool(getattr(self, "supports_configured_tool_calls", True))
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
