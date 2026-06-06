@@ -32,6 +32,7 @@
           "maxReportChars": 16000,
           "appendFullReport": true,
           "returnCloudDirectly": false,
+          "returnCloudJson": false,
           "timeoutSeconds": 90,
           "splitLongReports": true,
           "matrixChunkChars": 3500

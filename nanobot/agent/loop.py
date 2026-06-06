@@ -1536,12 +1536,14 @@ class AgentLoop:
         normalized = name.casefold().replace(" ", "_").replace("/", "_").replace("-", "_")
         aliases = {
             "key_points": "key_points",
+            "keypoints": "key_points",
             "citations_evidence": "sources",
             "citations": "sources",
             "evidence": "sources",
             "source": "sources",
             "sources": "sources",
             "full_report": "full_report",
+            "fullreport": "full_report",
             "report": "full_report",
             "details": "full_report",
             "detailed_answer": "full_report",
@@ -1551,8 +1553,78 @@ class AgentLoop:
         return aliases.get(normalized, normalized)
 
     @staticmethod
+    def _strip_cloud_code_fence(text: str) -> str:
+        stripped = (text or "").replace("\r\n", "\n").strip()
+        fence = re.match(r"^```(?:json|JSON|markdown|md)?\s*\n(?P<body>.*)\n```$", stripped, flags=re.S)
+        return fence.group("body").strip() if fence else stripped
+
+    @staticmethod
+    def _decode_cloud_text_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return "\n".join(f"- {AgentLoop._decode_cloud_text_value(item)}" for item in value if str(item).strip())
+        if isinstance(value, dict):
+            with suppress(Exception):
+                return json.dumps(value, ensure_ascii=False, indent=2)
+        text = str(value).replace("\r\n", "\n").strip()
+        text = AgentLoop._strip_cloud_code_fence(text)
+        text = text.strip().strip(",")
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+            quoted = text if text[0] == '"' else '"' + text[1:-1].replace('"', '\\"') + '"'
+            with suppress(Exception):
+                decoded = json.loads(quoted)
+                if isinstance(decoded, str):
+                    text = decoded
+                else:
+                    text = str(decoded)
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+                text = text[1:-1]
+        if any(token in text for token in (r"\n", r"\t", r"\"", r"\\")):
+            wrapped = '"' + text.replace('\\', r'\\').replace('"', r'\"') + '"'
+            with suppress(Exception):
+                decoded = json.loads(wrapped)
+                if isinstance(decoded, str):
+                    text = decoded
+            text = text.replace(r"\n", "\n").replace(r"\t", "    ").replace(r"\"", '"').replace(r"\\", "\\")
+        text = re.sub(r"^\s*\{\s*\n?", "", text)
+        text = re.sub(r"\n?\s*\}\s*$", "", text)
+        return text.strip()
+
+    @staticmethod
+    def _extract_lenient_cloud_fields(raw_text: str) -> dict[str, str]:
+        label_re = re.compile(
+            r'(?im)(?:^|[,\n{]\s*)["\']?'
+            r'(summary|key[_ -]?points|citations\s*/\s*evidence|citations|evidence|sources?|'
+            r'full[_ -]?report|report|details|detailed[_ -]?answer|limitations)'
+            r'["\']?\s*:\s*'
+        )
+        matches = list(label_re.finditer(raw_text))
+        if not matches:
+            return {}
+        sections: dict[str, str] = {}
+        for idx, match in enumerate(matches):
+            key = AgentLoop._canonical_cloud_section(match.group(1))
+            value_start = match.end()
+            value_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw_text)
+            value = raw_text[value_start:value_end].strip()
+            value = re.sub(r"^\s*[,\n]+", "", value)
+            value = re.sub(r"[,\s]*$", "", value)
+            value = value.strip()
+            if value.startswith("[") and value.endswith("]"):
+                with suppress(Exception):
+                    parsed = json.loads(value)
+                    value = AgentLoop._decode_cloud_text_value(parsed)
+            else:
+                value = AgentLoop._decode_cloud_text_value(value)
+            if value:
+                existing = sections.get(key, "")
+                sections[key] = f"{existing}\n{value}".strip() if existing else value
+        return sections
+
+    @staticmethod
     def _extract_cloud_sections(text: str) -> dict[str, str]:
-        raw_text = (text or "").replace("\r\n", "\n").strip()
+        raw_text = AgentLoop._strip_cloud_code_fence((text or "").replace("\r\n", "\n").strip())
         if not raw_text:
             return {"summary": "", "full_report": "", "sources": ""}
         parsed = AgentLoop._parse_json_object(raw_text)
@@ -1560,16 +1632,27 @@ class AgentLoop:
             sections: dict[str, str] = {}
             for key, value in parsed.items():
                 canonical = AgentLoop._canonical_cloud_section(str(key))
-                if isinstance(value, list):
-                    sections[canonical] = "\n".join(f"- {item}" for item in value if str(item).strip())
-                elif value is not None:
-                    sections[canonical] = str(value).strip()
-            sections.setdefault("full_report", raw_text)
+                sections[canonical] = AgentLoop._decode_cloud_text_value(value)
+            sections.setdefault("full_report", sections.get("details") or sections.get("summary") or "")
             sections.setdefault("summary", sections.get("full_report", ""))
             sections.setdefault("sources", "")
             return sections
 
+        lenient = AgentLoop._extract_lenient_cloud_fields(raw_text)
+        if lenient:
+            lenient.setdefault("full_report", lenient.get("summary", ""))
+            lenient.setdefault("summary", lenient.get("full_report", ""))
+            lenient.setdefault("sources", "")
+            return lenient
+
         header_re = re.compile(
+            r"^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?"
+            r"(summary|key[_ -]?points|citations\s*/\s*evidence|citations|evidence|sources?|"
+            r"full[_ -]?report|report|details|detailed[_ -]?answer|limitations)"
+            r"\s*:?\s*$",
+            re.I,
+        )
+        inline_header_re = re.compile(
             r"^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?"
             r"(summary|key[_ -]?points|citations\s*/\s*evidence|citations|evidence|sources?|"
             r"full[_ -]?report|report|details|detailed[_ -]?answer|limitations)"
@@ -1581,26 +1664,28 @@ class AgentLoop:
         lines: list[str] = []
         saw_header = False
         for raw in raw_text.splitlines():
-            match = header_re.match(raw)
+            inline_match = inline_header_re.match(raw)
+            header_match = header_re.match(raw)
+            match = inline_match or header_match
             if match:
                 if lines or saw_header:
                     existing = sections.get(current, "")
-                    block = "\n".join(lines).strip()
+                    block = AgentLoop._decode_cloud_text_value("\n".join(lines).strip())
                     if block:
                         sections[current] = f"{existing}\n{block}".strip() if existing else block
                 current = AgentLoop._canonical_cloud_section(match.group(1))
-                rest = match.group(2).strip()
+                rest = inline_match.group(2).strip() if inline_match else ""
                 lines = [rest] if rest else []
                 saw_header = True
                 continue
             lines.append(raw.rstrip())
-        block = "\n".join(lines).strip()
+        block = AgentLoop._decode_cloud_text_value("\n".join(lines).strip())
         if block:
             existing = sections.get(current, "")
             sections[current] = f"{existing}\n{block}".strip() if existing else block
         if not saw_header:
-            sections["full_report"] = raw_text
-        sections.setdefault("full_report", raw_text)
+            sections["full_report"] = AgentLoop._decode_cloud_text_value(raw_text)
+        sections.setdefault("full_report", sections.get("summary", raw_text))
         sections.setdefault("summary", sections.get("full_report", ""))
         sections.setdefault("sources", "")
         return sections
@@ -1613,8 +1698,18 @@ class AgentLoop:
         return text
 
     @staticmethod
+    def _sanitize_cloud_markdown(text: str) -> str:
+        cleaned = AgentLoop._decode_cloud_text_value(text)
+        cleaned = re.sub(r"^\s*[\"']?(?:summary|key[_ -]?points|sources?|full[_ -]?report|report|details|limitations)[\"']?\s*:\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"^\s*```(?:json|JSON|markdown|md)?\s*\n", "", cleaned)
+        cleaned = re.sub(r"\n```\s*$", "", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(r"^[ \t]+$", "", cleaned, flags=re.M)
+        return cleaned.strip().strip('"').strip()
+
+    @staticmethod
     def _truncate_cloud_report(text: str, max_chars: int) -> str:
-        text = (text or "").strip()
+        text = AgentLoop._sanitize_cloud_markdown(text)
         if max_chars > 0 and len(text) > max_chars:
             note = "\n\n[report truncated]"
             return text[: max(0, max_chars - len(note))].rstrip() + note
@@ -1622,26 +1717,61 @@ class AgentLoop:
 
     @staticmethod
     def _clean_local_cloud_answer(text: str) -> str:
-        cleaned = (text or "").strip()
+        cleaned = AgentLoop._sanitize_cloud_markdown(text)
         cleaned = re.sub(r"^\s*(?:short\s+answer|answer|summary)\s*:\s*", "", cleaned, flags=re.I)
         cleaned = re.sub(r"^\s*details(?=[A-Z])", "", cleaned)
         return cleaned.strip()
 
     @staticmethod
+    def _sanitize_cloud_url(url: str) -> str:
+        cleaned = AgentLoop._decode_cloud_text_value(url)
+        cleaned = cleaned.strip().strip('"\'`<>()[]{}')
+        cleaned = re.sub(r"[`'\"]+$", "", cleaned)
+        cleaned = re.sub(r"[.,;:)\]}]+$", "", cleaned)
+        cleaned = cleaned.replace("\\/", "/")
+        if not cleaned.casefold().startswith(("http://", "https://")):
+            return ""
+        if "<" in cleaned or cleaned.casefold().startswith(("http://<", "https://<")):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _sanitize_cloud_source(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, dict):
+            title = AgentLoop._sanitize_cloud_markdown(str(value.get("title") or value.get("name") or ""))
+            url = AgentLoop._sanitize_cloud_url(str(value.get("url") or value.get("link") or value.get("source") or ""))
+            return f"{title} — {url}" if title and url else (url or title)
+        text = AgentLoop._sanitize_cloud_markdown(str(value))
+        text = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", text).strip()
+        url_matches = re.findall(r"https?://[^\s)\]>}\"']+", text)
+        cleaned_urls = [url for url in (AgentLoop._sanitize_cloud_url(match) for match in url_matches) if url]
+        if cleaned_urls:
+            url = cleaned_urls[0]
+            title = text.replace(url_matches[0], "")
+            title = re.sub(r"\s*[—–-]\s*$", "", title).strip().strip('"\'`')
+            title = re.sub(r"^[`\"']+|[`\"']+$", "", title).strip()
+            return f"{title} — {url}" if title else url
+        if text.casefold().startswith(("http://", "https://")):
+            return AgentLoop._sanitize_cloud_url(text)
+        return text.strip().strip('"\'`')
+
+    @staticmethod
     def _extract_cloud_sources(sections: dict[str, str], metadata: dict[str, Any] | None = None) -> list[str]:
         sources: list[str] = []
+        seen: set[str] = set()
 
         def add_source(value: Any) -> None:
-            if value is None:
+            text = AgentLoop._sanitize_cloud_source(value)
+            if not text:
                 return
-            if isinstance(value, dict):
-                title = str(value.get("title") or value.get("name") or "").strip()
-                url = str(value.get("url") or value.get("link") or value.get("source") or "").strip()
-                text = f"{title} — {url}" if title and url else (url or title)
-            else:
-                text = str(value).strip()
-            if text and not any(text == existing or text in existing or existing in text for existing in sources):
-                sources.append(text)
+            url_match = re.search(r"https?://\S+", text)
+            key = AgentLoop._sanitize_cloud_url(url_match.group(0)) if url_match else text.casefold()
+            if not key or key in seen:
+                return
+            seen.add(key)
+            sources.append(text)
 
         for key in ("citations", "references", "search_results"):
             value = (metadata or {}).get(key)
@@ -1652,11 +1782,10 @@ class AgentLoop:
                 add_source(value)
         source_text = sections.get("sources") or ""
         for line in source_text.splitlines():
-            line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
             add_source(line)
         combined = "\n".join(str(value or "") for value in sections.values())
-        for url in re.findall(r"https?://[^\s)\]>}]+", combined):
-            add_source(url.rstrip(".,;"))
+        for url in re.findall(r"https?://[^\s)\]>}\"']+", combined):
+            add_source(url)
         return sources
 
     @staticmethod
@@ -1675,18 +1804,29 @@ class AgentLoop:
 
     def _build_cloud_handoff_messages(self, request: str, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         history_text = self._context_pipeline_cloud_history_text(history)
+        cfg = self._context_pipeline_cloud_cfg()
+        if bool(getattr(cfg, "return_cloud_json", False)):
+            structure = (
+                "Return JSON with keys: summary, key_points, full_report, sources, limitations. "
+                "Decode-ready strings are required; include direct source URLs."
+            )
+        else:
+            structure = (
+                "Return Markdown sections, not JSON, using this exact shape:\n"
+                "Summary\n...\n\n"
+                "Key points\n- ...\n\n"
+                "Full report\n...\n\n"
+                "Sources\n- Title — URL\n\n"
+                "Limitations\n...\n"
+                "Avoid JSON unless explicitly requested. Markdown is easier to show in Matrix "
+                "and prevents escaped newline artifacts."
+            )
         prompt = (
             f"User request:\n{request}\n\n"
             "Recent conversation summary, if relevant:\n"
             f"{history_text or 'No recent conversation provided.'}\n\n"
             "Instructions:\n"
-            "Return this structure in plain text or JSON:\n"
-            "- summary: compact 5-10 sentence summary\n"
-            "- key_points: bullet list\n"
-            "- citations/evidence: titles + URLs if available\n"
-            "- sources: direct URLs with titles when available\n"
-            "- full_report: detailed answer/report\n"
-            "- limitations: anything uncertain\n\n"
+            f"{structure}\n\n"
             "Include a Sources section with direct URLs. Do not use citation numbers without "
             "listing the corresponding URLs. Do not include secrets. Do not claim actions were "
             "performed unless actually performed."
@@ -1779,11 +1919,16 @@ class AgentLoop:
         ctx.prompt_injection_tools_used.append("cloud_escalation")
 
         if bool(getattr(cfg, "return_cloud_directly", False)):
-            final = raw_cloud.strip()
-            if source_block and "sources:" not in final.casefold():
-                final = f"{final}\n\n{source_block}"
-            if bool(getattr(cfg, "append_full_report", True)) and report and report not in final:
-                final = f"{final}\n\nCloud report:\n{report}"
+            final_parts: list[str] = []
+            if summary:
+                final_parts.append(f"Summary:\n{summary}")
+            if key_points:
+                final_parts.append(f"Key points:\n{key_points}")
+            if bool(getattr(cfg, "append_full_report", True)) and report:
+                final_parts.append(f"Cloud report:\n{report}")
+            if source_block:
+                final_parts.append(source_block)
+            final = "\n\n".join(final_parts).strip() or self._sanitize_cloud_markdown(raw_cloud)
             messages = list(cloud_messages)
             messages.append({"role": "assistant", "content": final})
             return final, list(ctx.prompt_injection_tools_used), messages, "completed", False
@@ -2757,7 +2902,7 @@ class AgentLoop:
         report_chunks = self._split_text_chunks(report, report_chunk_budget)
         total_parts = len(report_chunks)
         chunks.extend(
-            f"Cloud report (part {idx}/{total_parts}):\n{chunk}"
+            f"Cloud report (part {idx}/{total_parts})\n\n{chunk}"
             for idx, chunk in enumerate(report_chunks, 1)
         )
         if sources:

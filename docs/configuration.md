@@ -1116,6 +1116,7 @@ without chat history, skills, or tool schemas:
           "maxReportChars": 16000,
           "appendFullReport": true,
           "returnCloudDirectly": false,
+          "returnCloudJson": false,
           "timeoutSeconds": 90,
           "splitLongReports": true,
           "matrixChunkChars": 3500
@@ -1182,6 +1183,7 @@ without chat history, skills, or tool schemas:
 | `cloudEscalation.maxSummaryChars` / `maxReportChars` | `2500` / `16000` | Caps the compact summary fed back to the local model and the appended full report. |
 | `cloudEscalation.appendFullReport` | `true` | Append the trimmed cloud report below the local RKLLAMA-facing answer. |
 | `cloudEscalation.returnCloudDirectly` | `false` | Skip the final local pass and return the cloud output directly. |
+| `cloudEscalation.returnCloudJson` | `false` | Ask the cloud specialist for JSON instead of Markdown. Keep this off for Matrix-friendly reports. |
 | `cloudEscalation.splitLongReports` / `matrixChunkChars` | `true` / `3500` | Split long Matrix cloud reports into a short-answer message, report parts, and sources. |
 
 Configure web search under [`tools.web.search`](#toolswebsearch). The pipeline does not

@@ -77,6 +77,7 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
                 "maxReportChars": 1200,
                 "appendFullReport": True,
                 "returnCloudDirectly": False,
+                "returnCloudJson": True,
                 "timeoutSeconds": 30,
             },
             "chatHistory": {
@@ -104,6 +105,7 @@ def test_plain_chat_config_accepts_camel_case_aliases() -> None:
     assert defaults.context_pipeline.cloud_escalation.require_explicit_trigger is True
     assert defaults.context_pipeline.cloud_escalation.max_summary_chars == 700
     assert defaults.context_pipeline.cloud_escalation.max_report_chars == 1200
+    assert defaults.context_pipeline.cloud_escalation.return_cloud_json is True
     assert defaults.context_pipeline.cloud_escalation.timeout_seconds == 30
     assert defaults.context_pipeline.chat_history.enabled is True
     assert defaults.context_pipeline.chat_history.max_turns == 3
@@ -566,6 +568,11 @@ def test_context_pipeline_cloud_escalation_feeds_summary_to_local_and_appends_re
         assert "Sources:\n1. Example — https://example.com" in result.content
         assert len(cloud_provider.calls) == 1
         assert cloud_provider.calls[0]["tools"] is None
+        cloud_prompt = "\n".join(
+            str(message.get("content", "")) for message in cloud_provider.calls[0]["messages"]
+        )
+        assert "Return Markdown sections, not JSON" in cloud_prompt
+        assert "Avoid JSON unless explicitly requested" in cloud_prompt
         local_final_prompt = "\n".join(
             str(message.get("content", "")) for message in local_provider.calls[-1]["messages"]
         )
@@ -630,6 +637,86 @@ def test_context_pipeline_cloud_parser_sources_truncation_and_chunks(tmp_path) -
     assert any(chunk.startswith("Cloud report (part") for chunk in chunks[1:])
     assert chunks[-1].startswith("Sources:")
     assert all(len(chunk) <= 500 for chunk in chunks)
+
+
+def test_context_pipeline_cloud_json_report_is_rendered_cleanly(tmp_path) -> None:
+    raw = (
+        '{\n'
+        '  "summary": "RKLLama is...",\n'
+        '  "full_report": "1. Conceptual comparison\\n\\n1.1 Purpose\\n- RKLLama\\n - Described as an \\\"Ollama alternative for Rockchip NPU\\\".\\n\\nSteps include:\\n - Install MicroK8s: sudo snap install microk8s --classic",\n'
+        '  "sources": [\n'
+        '    "https://github.com/NotPunchnox/rkllama",\n'
+        '    "https://github.com/invisiofficial/rk-llama.cpp/blob/rknpu2/ggml/src/ggml-rknpu2/README.md\\\"",\n'
+        '    "`http://localhost:11434`",\n'
+        '    "http://<ip"\n'
+        '  ]\n'
+        '}'
+    )
+    sections = AgentLoop._extract_cloud_sections(raw)
+    report = AgentLoop._truncate_cloud_report(sections["full_report"], 4000)
+    sources = AgentLoop._format_cloud_sources(AgentLoop._extract_cloud_sources(sections))
+    final = f"Short answer:\nLocal answer.\n\nCloud report:\n{report}\n\n{sources}"
+
+    assert '"full_report"' not in final
+    assert "\\n" not in final
+    assert "{\n" not in final
+    assert "Ollama alternative for Rockchip NPU" in final
+    assert 'Described as an "Ollama alternative for Rockchip NPU".' in final
+    assert "https://github.com/invisiofficial/rk-llama.cpp/blob/rknpu2/ggml/src/ggml-rknpu2/README.md\"" not in final
+    assert "https://github.com/invisiofficial/rk-llama.cpp/blob/rknpu2/ggml/src/ggml-rknpu2/README.md" in final
+    assert "http://localhost:11434`" not in final
+    assert "http://localhost:11434" in final
+    assert "http://<ip" not in final
+    assert final.count("Sources:") == 1
+
+    cfg = AgentDefaults.model_validate({
+        "contextPipeline": {
+            "enableCloudEscalation": True,
+            "cloudEscalation": {"enabled": True, "matrixChunkChars": 500, "splitLongReports": True},
+        }
+    }).context_pipeline
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=PlainFakeProvider(supports_tools=False),
+        workspace=tmp_path,
+        model="fake-small",
+        context_window_tokens=2048,
+        plain_chat_when_tools_unsupported=True,
+        tool_execution_mode="context_pipeline",
+        context_pipeline=cfg,
+    )
+    chunks = loop._cloud_escalation_outbound_chunks(final + "\n\n" + ("More report text. " * 80))
+    rendered = "\n\n".join(chunks)
+    assert '"full_report"' not in rendered
+    assert "\\n" not in rendered
+    assert any(chunk.startswith("Cloud report (part") for chunk in chunks)
+
+
+def test_context_pipeline_cloud_fenced_and_lenient_json_render_cleanly() -> None:
+    fenced = """```json
+{
+  "summary": "Short summary",
+  "full_report": "Line 1\\n\\nLine 2\\n- bullet",
+  "sources": ["Docs — https://example.com/docs\""]
+}
+```"""
+    sections = AgentLoop._extract_cloud_sections(fenced)
+    assert sections["summary"] == "Short summary"
+    assert sections["full_report"] == "Line 1\n\nLine 2\n- bullet"
+    assert "https://example.com/docs" in AgentLoop._format_cloud_sources(AgentLoop._extract_cloud_sources(sections))
+    assert "\\n" not in AgentLoop._truncate_cloud_report(sections["full_report"], 500)
+
+    malformed = '{"summary": "S", "full_report": "First line\\nSecond line with "inner quotes"", "sources": ["https://example.com/a\""]}'
+    malformed_sections = AgentLoop._extract_cloud_sections(malformed)
+    malformed_report = AgentLoop._truncate_cloud_report(malformed_sections["full_report"], 500)
+    assert '"full_report"' not in malformed_report
+    assert "First line\nSecond line" in malformed_report
+    assert "inner quotes" in malformed_report
+
+    markdown = "Summary\nAlready clear.\n\nFull report\nUse `ollama pull qwen3`.\n\nSources\n- Docs — https://example.com/docs"
+    markdown_sections = AgentLoop._extract_cloud_sections(markdown)
+    assert markdown_sections["summary"] == "Already clear."
+    assert "`ollama pull qwen3`" in markdown_sections["full_report"]
 
 
 def test_context_pipeline_cloud_missing_key_and_return_direct(tmp_path) -> None:
@@ -698,7 +785,8 @@ def test_context_pipeline_cloud_missing_key_and_return_direct(tmp_path) -> None:
             InboundMessage(channel="matrix", sender_id="@u:s", chat_id="room2", content="deep research x")
         )
         assert direct_result is not None
-        assert direct_result.content == "summary: cloud answer\nfull_report: cloud report"
+        assert direct_result.content == "Summary:\ncloud answer"
+        assert "full_report:" not in direct_result.content
         assert len(direct_local.calls) == 1
         assert len(direct_cloud.calls) == 1
     asyncio.run(run())
