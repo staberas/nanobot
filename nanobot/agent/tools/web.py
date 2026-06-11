@@ -46,6 +46,7 @@ class WebSearchConfig(Base):
 class WebFetchConfig(Base):
     """Web fetch tool configuration."""
     use_jina_reader: bool = True
+    max_chars: int = Field(default=50000, ge=500, le=200000)
 
 
 class WebToolsConfig(Base):
@@ -707,6 +708,7 @@ class WebFetchTool(Tool):
             config=ctx.config.web.fetch,
             proxy=ctx.config.web.proxy,
             user_agent=ctx.config.web.user_agent,
+            max_chars=ctx.config.web.fetch.max_chars,
         )
 
     def __init__(self, config: WebFetchConfig | None = None, proxy: str | None = None, user_agent: str | None = None, max_chars: int = 50000):
@@ -728,6 +730,7 @@ class WebFetchTool(Tool):
     ) -> Any:
         url = url.strip(" \t\r\n`\"'")
         extract_mode = kwargs.pop("extractMode", extract_mode)
+        use_jina = kwargs.pop("useJina", kwargs.pop("use_jina", self.config.use_jina_reader))
         max_chars = kwargs.pop("maxChars", max_chars) or self.max_chars
         is_valid, error_msg = _validate_url_safe(url)
         if not is_valid:
@@ -759,7 +762,7 @@ class WebFetchTool(Tool):
             logger.debug("Pre-fetch image detection failed for {}: {}", url, e)
 
         result = None
-        if self.config.use_jina_reader:
+        if bool(use_jina):
             result = await self._fetch_jina(url, max_chars)
         if result is None:
             result = await self._fetch_readability(url, extract_mode, max_chars)
@@ -794,6 +797,7 @@ class WebFetchTool(Tool):
 
             return json.dumps({
                 "url": url, "finalUrl": data.get("url", url), "status": r.status_code,
+                "contentType": r.headers.get("content-type", ""),
                 "extractor": "jina", "truncated": truncated, "length": len(text),
                 "untrusted": True, "text": text,
             }, ensure_ascii=False)
@@ -842,12 +846,18 @@ class WebFetchTool(Tool):
 
             return json.dumps({
                 "url": url, "finalUrl": str(r.url), "status": r.status_code,
+                "contentType": ctype,
                 "extractor": extractor, "truncated": truncated, "length": len(text),
                 "untrusted": True, "text": text,
             }, ensure_ascii=False)
         except httpx.ProxyError as e:
             logger.exception("WebFetch proxy error for {}", url)
             return json.dumps({"error": f"Proxy error: {e}", "url": url}, ensure_ascii=False)
+        except httpx.HTTPStatusError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            reason = getattr(getattr(e, "response", None), "reason_phrase", "")
+            logger.exception("WebFetch HTTP error for {}", url)
+            return json.dumps({"error": reason or str(e), "status": status, "url": url}, ensure_ascii=False)
         except Exception as e:
             logger.exception("WebFetch error for {}", url)
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)

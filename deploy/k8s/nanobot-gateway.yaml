@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nanobot-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nanobot-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nanobot-gateway
+  template:
+    metadata:
+      labels:
+        app: nanobot-gateway
+    spec:
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: nanobot
+          image: ghcr.io/your-org/nanobot:rkllama-context-pipeline
+          imagePullPolicy: IfNotPresent
+          args: ["gateway"]
+          ports:
+            - name: gateway
+              containerPort: 18790
+            - name: websocket
+              containerPort: 8765
+          env:
+            - name: HOME
+              value: /home/nanobot
+          volumeMounts:
+            - name: data
+              mountPath: /home/nanobot/.nanobot
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_ADMIN"]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nanobot-data

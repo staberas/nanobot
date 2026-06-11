@@ -1,0 +1,102 @@
+{
+  "agents": {
+    "defaults": {
+      "provider": "rkllama",
+      "model": "Qwen3-1.7B-atlas-9k",
+      "contextWindowTokens": 8500,
+      "maxTokens": 512,
+      "temperature": 0.1,
+      "maxToolIterations": 0,
+      "plainChatWhenToolsUnsupported": true,
+      "plainChatSystemPrompt": "You are a local long-context assistant for PDFs, notes, logs, links, and retrieval.\nYou can answer normal general-knowledge questions when no document/context is required.\nYou are optimized for extracting and summarizing provided text, logs, URLs, and document chunks.\nRules:\n\n* Follow explicit user instructions literally.\n* If the user asks ‘reply exactly’, output only the requested text.\n* If the user asks a normal known fact, answer directly and briefly.\n* Do not say ‘not in provided context’ for ordinary general-knowledge questions.\n* If the user asks about a Matrix attachment/file and no extracted file text is present, say you cannot read Matrix attachments yet.\n* Never claim you received, opened, or reviewed a file unless file text/content is actually present.\n* If the user provides a URL and asks to read/fetch/summarize it, use the URL itself, not generic web search results.\n* For RSS/news feeds, summarize feed items: title, short summary, and link if available.\n* Be concise.\n* For PDFs/logs, prefer bullet summaries and concrete findings.\n* If unsure, say what is missing.",
+      "toolExecutionMode": "context_pipeline",
+      "contextPipeline": {
+        "enabled": true,
+        "maxPlannerTokens": 64,
+        "maxReducerTokens": 96,
+        "maxFinalEvidenceChars": 6000,
+        "maxSearchResults": 5,
+        "maxRelevantResults": 3,
+        "enableWebFetch": true,
+        "fetchMaxChars": 8000,
+        "fallbackSearchOnFetchFail": false,
+        "enableCron": false,
+        "enableCloudEscalation": false,
+        "chatHistory": {
+          "enabled": true,
+          "maxTurns": 4,
+          "maxChars": 2500,
+          "includeAssistant": true,
+          "includeOnlyWhenAction": ["answer_directly", "ask_clarifying"]
+        }
+      },
+      "toolSelection": {
+        "enabled": true,
+        "mode": "heuristic",
+        "maxTools": 1,
+        "allow": ["web_search", "web_fetch"],
+        "deny": [
+          "apply_patch",
+          "run_cli_app",
+          "complete_goal",
+          "cron",
+          "edit_file",
+          "exec",
+          "find_files",
+          "grep",
+          "list_dir",
+          "list_exec_sessions",
+          "long_task",
+          "message",
+          "read_file",
+          "spawn",
+          "write_file",
+          "write_stdin",
+          "my"
+        ]
+      }
+    }
+  },
+  "tools": {
+    "web": {
+      "fetch": {
+        "maxChars": 12000
+      }
+    }
+  },
+  "memory": {
+    "dream": {
+      "enabled": true,
+      "toolsRequired": false,
+      "skipWhenToolsUnsupported": false,
+      "plainChatFallback": true
+    }
+  },
+  "providers": {
+    "rkllama": {
+      "apiKey": null,
+      "apiBase": "http://192.168.100.23:30082/v1",
+      "capabilities": {
+        "tools": false,
+        "toolChoice": false,
+        "parallelToolCalls": false,
+        "responseFormat": false,
+        "maxCompletionTokens": false,
+        "preferMaxTokens": true
+      }
+    }
+  },
+  "channels": {
+    "matrix": {
+      "enabled": true,
+      "homeserver": "https://baltas.top:30071",
+      "userId": "@atlas:baltas.top",
+      "groupPolicy": "mentions",
+      "respondInDm": true,
+      "respondWhenMentioned": true,
+      "respondToAliases": ["atlas"],
+      "respondToPrefixes": ["atlas:", "atlas,"],
+      "ignoreMessagesMentioningOthersOnly": true
+    }
+  }
+}

@@ -887,6 +887,9 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        tools_required: bool = False,
+        skip_when_tools_unsupported: bool = False,
+        plain_chat_fallback: bool = True,
     ):
         self.store = store
         self.provider = provider
@@ -898,6 +901,9 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed MEMORY.md raw
         # (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        self.tools_required = tools_required
+        self.skip_when_tools_unsupported = skip_when_tools_unsupported
+        self.plain_chat_fallback = plain_chat_fallback
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -962,6 +968,67 @@ class Dream:
                 desc = m.group(1).strip() if m else "(no description)"
                 entries[d.name] = desc
         return [f"{name} — {desc}" for name, desc in sorted(entries.items())]
+
+    def _provider_supports_tools(self) -> bool:
+        supports = getattr(self.provider, "supports_tools", None)
+        if callable(supports):
+            with suppress(Exception):
+                return bool(supports())
+        return bool(getattr(self.provider, "supports_configured_tool_calls", True))
+
+    async def _run_plain_chat_fallback(
+        self,
+        *,
+        history_text: str,
+        file_context: str,
+        batch: list[dict[str, Any]],
+    ) -> bool:
+        prompt = (
+            "You are Nanobot's memory consolidation backend. The current provider does not "
+            "support tools, so you must not request file reads or edits.\n\n"
+            "Read the recent conversation history and current memory files below. Return only "
+            "compact Markdown bullet points that should be appended to MEMORY.md. Include stable "
+            "user/project preferences, durable facts, or recurring tasks. If there is nothing "
+            "worth remembering, return exactly NO_CHANGES.\n\n"
+            f"## Conversation History\n{history_text}\n\n{file_context}"
+        )
+        try:
+            response = await self.provider.chat_with_retry(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Summarize durable memory as concise Markdown bullets. No tools.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+                tool_choice=None,
+            )
+        except Exception:
+            logger.exception("Dream plain-chat fallback failed")
+            return False
+
+        notes = (response.content or "").strip()
+        new_cursor = batch[-1]["cursor"]
+        if not notes or notes.upper() == "NO_CHANGES":
+            self.store.set_last_dream_cursor(new_cursor)
+            self.store.compact_history()
+            logger.info("Dream plain-chat fallback: no changes, cursor advanced to {}", new_cursor)
+            return True
+
+        current = self.store.read_memory().rstrip()
+        ts = batch[-1]["timestamp"]
+        addition = f"\n\n## Dream notes — {ts}\n{notes}\n"
+        self.store.write_memory((current + addition).lstrip())
+        self.store.set_last_dream_cursor(new_cursor)
+        self.store.compact_history()
+        logger.info("Dream plain-chat fallback wrote {} chars, cursor advanced to {}", len(notes), new_cursor)
+        if self.store.git.is_initialized():
+            sha = self.store.git.auto_commit(f"dream: {ts}, plain-chat memory update\n\n{notes}")
+            if sha:
+                logger.info("Dream commit: {}", sha)
+        return True
 
     # -- main entry ----------------------------------------------------------
 
@@ -1058,6 +1125,18 @@ class Dream:
             f"## Current SOUL.md ({len(current_soul)} chars)\n{current_soul}\n\n"
             f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
         )
+
+        if not self._provider_supports_tools():
+            if self.skip_when_tools_unsupported or self.tools_required or not self.plain_chat_fallback:
+                logger.info(
+                    "Dream skipped: provider does not support tools and no plain memory backend is configured"
+                )
+                return False
+            return await self._run_plain_chat_fallback(
+                history_text=history_text,
+                file_context=file_context,
+                batch=batch,
+            )
 
         # Phase 1: Analyze (no skills list — dedup is Phase 2's job)
         phase1_prompt = (
