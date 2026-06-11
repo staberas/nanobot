@@ -1172,7 +1172,8 @@ without chat history, skills, or tool schemas:
 | `maxSearchResults` | `5` | Search results requested and considered by the reducer. |
 | `maxRelevantResults` | `3` | Top reduced evidence items kept for the final prompt. |
 | `enableWebFetch` | `false` | Fetch and summarize top result pages. Leave off for very small models unless needed. |
-| `fetchMaxChars` | `3000` | Maximum page text passed to the fetch reducer. |
+| `fetchMaxChars` | `3000` | Maximum page text passed to fetch/reducer prompts; use higher values such as `8000` for Atlas-style 9K models. |
+| `fallbackSearchOnFetchFail` | `false` | Reserved switch for fallback search after direct URL fetch failure; default behavior reports the direct failure and does not search unrelated pages. |
 | `enableCron` | `false` | Enable deterministic reminder scheduling through CronService when `cron` is also allowed by `toolSelection`. |
 | `defaultReminderTime` | `"09:00"` | Default HH:MM used for phrases such as `every morning` or date-only reminders. |
 | `timezone` | `null` | Optional IANA timezone for context-pipeline reminders, for example `Europe/Athens`; falls back to the agent timezone or UTC. |
@@ -1863,3 +1864,28 @@ Set `agents.defaults.toolHintMaxLength` to control the truncation threshold:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `agents.defaults.toolHintMaxLength` | `40` | Maximum characters for tool hint display. Range: 20–500. Higher values show more of the command or path; lower values keep hints compact. |
+
+### Atlas / long-context RKLLAMA Matrix bot
+
+For a second local-first Matrix bot that is optimized for long-context retrieval, use a
+separate deployment/config secret and keep RKLLAMA as the default provider. See
+[`examples/atlas-context-pipeline.config.json`](../examples/atlas-context-pipeline.config.json)
+for a complete config using:
+
+- `model: Qwen3-1.7B-atlas-9k`
+- `contextWindowTokens: 8500`
+- `maxTokens: 512`
+- `temperature: 0.1`
+- `toolExecutionMode: context_pipeline`
+- `contextPipeline.enableCron: false`
+- `contextPipeline.enableCloudEscalation: false`
+- `contextPipeline.fetchMaxChars: 8000`
+- `contextPipeline.maxFinalEvidenceChars: 6000`
+- `tools.web.fetch.maxChars: 12000`
+- `toolSelection.allow: ["web_search", "web_fetch"]`
+
+The Atlas prompt is intentionally attachment-honest: Matrix file/PDF attachments are not
+claimed as read unless extracted text is actually present in the prompt. Direct URL
+requests such as `https://feeds.feedburner.com/kathimerini/DJpy summarize the news` are
+forced to `web_fetch` against the exact provided URL, and RSS/Atom responses are reduced
+as feed items rather than replaced with generic web-search results.

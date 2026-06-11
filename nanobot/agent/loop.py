@@ -8,10 +8,12 @@ import json
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from contextlib import AsyncExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
+from html import unescape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -779,6 +781,77 @@ class AgentLoop:
         query = re.sub(r"[?.!,;:]+$", "", query).strip()
         return query or (text or "").strip()
 
+    @staticmethod
+    def _extract_urls(text: str) -> list[str]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(r"https?://[^\s<>()\[\]{}\"']+", text or "", flags=re.I):
+            url = match.group(0).rstrip(".,;:!?)]}")
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
+
+    @staticmethod
+    def _looks_like_direct_url_fetch_request(request: str, urls: list[str]) -> bool:
+        if not urls:
+            return False
+        without_urls = re.sub(r"https?://\S+", " ", request or " ")
+        return bool(re.search(
+            r"\b(fetch|read|open|summari[sz]e|sum(?:marize)?|analy[sz]e|check|review|parse|what(?:'s| is)\s+in)\b",
+            without_urls,
+            flags=re.I,
+        ))
+
+    @staticmethod
+    def _exact_reply_text(request: str) -> str | None:
+        match = re.search(r"\breply\s+exactly\s+(.+?)\s*$", request or "", flags=re.I | re.S)
+        if not match:
+            return None
+        return match.group(1).strip().strip('"')
+
+    @staticmethod
+    def _message_has_extracted_attachment_text(msg: InboundMessage) -> bool:
+        if re.search(r"\[File:\s*[^\]]+\]", msg.content or "", flags=re.I):
+            return True
+        for attachment in (msg.metadata or {}).get("attachments", []) or []:
+            if not isinstance(attachment, dict):
+                continue
+            for key in ("text", "content", "extracted_text", "transcription"):
+                if str(attachment.get(key) or "").strip():
+                    return True
+        return False
+
+    @staticmethod
+    def _message_has_unread_attachment_reference(msg: InboundMessage, history: list[dict[str, Any]] | None = None) -> bool:
+        if AgentLoop._message_has_extracted_attachment_text(msg):
+            return False
+        content = msg.content or ""
+        metadata_attachments = (msg.metadata or {}).get("attachments") or []
+        has_attachment_marker = bool(re.search(r"\[(?:attachment|Attachment):\s*[^\]]+\]", content))
+        has_media = bool(msg.media) or bool(metadata_attachments)
+        asks_about_attachment = bool(re.search(
+            r"\b(attach(?:ed|ment)?|file|pdf|document|docx|xlsx|pptx|image|photo)\b",
+            content,
+            flags=re.I,
+        ))
+        history_text = "\n".join(
+            str(item.get("content") or "")
+            for item in (history or [])
+            if isinstance(item, dict) and item.get("role") == "user"
+        )
+        history_has_unread_marker = bool(re.search(r"\[(?:attachment|Attachment):\s*[^\]]+\]", history_text)) and not bool(
+            re.search(r"\[File:\s*[^\]]+\]", history_text, flags=re.I)
+        )
+        return has_media or has_attachment_marker or (asks_about_attachment and history_has_unread_marker)
+
+    @staticmethod
+    def _attachment_unavailable_message() -> str:
+        return (
+            "I can see that a file was attached or mentioned, but I cannot read Matrix "
+            "attachments yet. Paste the text or use a PDF ingestion path."
+        )
+
     def _format_prompt_injection_result(self, tool_name: str, query: str, result: Any) -> str:
         raw = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         max_chars = max(0, int(self.tool_result_injection_max_chars or 0))
@@ -1112,6 +1185,14 @@ class AgentLoop:
         return self._context_pipeline_cloud_explicit_trigger(request) or self._context_pipeline_cloud_heuristic_request(request)
 
     def _context_pipeline_heuristic_plan_without_cloud(self, request: str) -> dict[str, Any]:
+        urls = self._extract_urls(request)
+        if self._looks_like_direct_url_fetch_request(request, urls):
+            return {
+                "action": "web_fetch",
+                "query": urls[0],
+                "url": urls[0],
+                "reason": "heuristic selected direct URL fetch",
+            }
         if self._looks_like_reminder_request(request):
             parsed = self._parse_context_pipeline_cron_request(request)
             return {
@@ -1159,6 +1240,14 @@ class AgentLoop:
         return max_tools > 0
 
     def _context_pipeline_heuristic_plan(self, request: str) -> dict[str, Any]:
+        urls = self._extract_urls(request)
+        if self._looks_like_direct_url_fetch_request(request, urls):
+            return {
+                "action": "web_fetch",
+                "query": urls[0],
+                "url": urls[0],
+                "reason": "heuristic selected direct URL fetch",
+            }
         if self._looks_like_reminder_request(request):
             parsed = self._parse_context_pipeline_cron_request(request)
             return {
@@ -1304,14 +1393,29 @@ class AgentLoop:
         *,
         recent_chat_history_available: bool = False,
     ) -> dict[str, Any]:
+        detected_urls = self._extract_urls(request)
+        if detected_urls:
+            logger.info("Context pipeline detected_urls={}", detected_urls)
+        if self._looks_like_direct_url_fetch_request(request, detected_urls):
+            logger.info("Context pipeline forced action=web_fetch")
+            plan = {
+                "action": "web_fetch",
+                "query": detected_urls[0],
+                "url": detected_urls[0],
+                "reason": "forced direct URL fetch",
+            }
+            logger.info('Context pipeline planner action={} query="{}"', plan["action"], plan["query"])
+            return plan
         prompt = (
             "You are a routing controller. Choose one action.\n\n"
             "Available actions:\n"
             "- answer_directly: answer without external tools\n"
             "- web_search: search the web for current/external information\n"
+            "- web_fetch: fetch/read/summarize an explicit user-provided URL\n"
             "- cron: schedule a reminder or recurring task\n"
             "- escalate_cloud_agent: hand off complex research/reasoning to the configured cloud specialist\n"
             "- ask_clarifying: ask one short clarification question\n\n"
+            "For web_fetch, use the exact user-provided URL as query and url. "
             "For cron, include reminder_text plus at (ISO datetime) or cron_expr and timezone. "
             "Never claim a reminder was scheduled via answer_directly. "
             "If the user refers to previous messages and recent chat history is available, "
@@ -1319,7 +1423,7 @@ class AgentLoop:
             f"Recent chat history available: {'yes' if recent_chat_history_available else 'no'}\n\n"
             f"User request:\n{request}\n\n"
             "Return JSON only:\n"
-            '{"action":"answer_directly|web_search|cron|escalate_cloud_agent|ask_clarifying","query":"...","reminder_text":"...","at":"...","cron_expr":"...","timezone":"...","reason":"..."}'
+            '{"action":"answer_directly|web_search|web_fetch|cron|escalate_cloud_agent|ask_clarifying","query":"...","url":"...","reminder_text":"...","at":"...","cron_expr":"...","timezone":"...","reason":"..."}'
         )
         response = await self._plain_provider_chat(
             [{"role": "user", "content": prompt}],
@@ -1336,12 +1440,12 @@ class AgentLoop:
         if action == "schedule_reminder":
             action = "cron"
         heuristic: dict[str, Any] | None = None
-        if action not in {"answer_directly", "web_search", "cron", "escalate_cloud_agent", "ask_clarifying"}:
+        if action not in {"answer_directly", "web_search", "web_fetch", "cron", "escalate_cloud_agent", "ask_clarifying"}:
             heuristic = self._context_pipeline_heuristic_plan(request)
             action = heuristic["action"]
         if action == "ask_clarifying":
             heuristic = heuristic or self._context_pipeline_heuristic_plan(request)
-            if heuristic.get("action") in {"web_search", "cron", "escalate_cloud_agent"}:
+            if heuristic.get("action") in {"web_search", "web_fetch", "cron", "escalate_cloud_agent"}:
                 parsed = {**heuristic, **parsed, "action": heuristic["action"]}
                 action = str(heuristic["action"])
             elif recent_chat_history_available and self._context_pipeline_history_reference_request(request):
@@ -1353,7 +1457,7 @@ class AgentLoop:
             if (
                 not self._context_pipeline_cloud_action_allowed(request)
                 or (
-                    no_cloud_heuristic.get("action") in {"web_search", "cron"}
+                    no_cloud_heuristic.get("action") in {"web_search", "web_fetch", "cron"}
                     and not self._context_pipeline_cloud_explicit_trigger(request)
                 )
             ):
@@ -1362,6 +1466,9 @@ class AgentLoop:
         query = str(parsed.get("query") or "").strip()
         if action == "web_search" and not query:
             query = self._plain_chat_search_query(request)
+        if action == "web_fetch":
+            query = str(parsed.get("url") or query or (self._extract_urls(request) or [""])[0]).strip()
+            parsed["url"] = query
         if action == "cron":
             fallback = self._parse_context_pipeline_cron_request(request)
             for key, value in fallback.items():
@@ -1374,7 +1481,7 @@ class AgentLoop:
             "query": query,
             "reason": str(parsed.get("reason") or "").strip(),
         }
-        for key in ("reminder_text", "at", "cron_expr", "timezone", "needs_clarification"):
+        for key in ("url", "reminder_text", "at", "cron_expr", "timezone", "needs_clarification"):
             if key in parsed and parsed.get(key) not in (None, ""):
                 plan[key] = parsed.get(key)
         logger.info('Context pipeline planner action={} query="{}"', action, query)
@@ -1515,6 +1622,169 @@ class AgentLoop:
         updated["summary"] = summary
         updated["url"] = str(parsed.get("url") or url)
         return updated
+
+    @staticmethod
+    def _parse_fetch_result(result: Any) -> dict[str, Any]:
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            with suppress(Exception):
+                parsed = json.loads(result)
+                if isinstance(parsed, dict):
+                    return parsed
+            return {"text": result}
+        return {"text": json.dumps(result, ensure_ascii=False)}
+
+    @staticmethod
+    def _xml_text(element: ET.Element | None) -> str:
+        if element is None or element.text is None:
+            return ""
+        return re.sub(r"\s+", " ", unescape(element.text)).strip()
+
+    @staticmethod
+    def _find_child_text(element: ET.Element, names: tuple[str, ...]) -> str:
+        wanted = {name.casefold() for name in names}
+        for child in list(element):
+            tag = child.tag.rsplit("}", 1)[-1].casefold()
+            if tag in wanted:
+                return AgentLoop._xml_text(child)
+        return ""
+
+    @staticmethod
+    def _find_child_link(element: ET.Element) -> str:
+        for child in list(element):
+            tag = child.tag.rsplit("}", 1)[-1].casefold()
+            if tag == "link":
+                href = child.attrib.get("href")
+                if href:
+                    return str(href).strip()
+                if child.text:
+                    return child.text.strip()
+        return ""
+
+    @staticmethod
+    def _parse_feed_items(text: str, max_items: int = 10) -> list[dict[str, str]]:
+        raw = (text or "").strip()
+        if raw.startswith("[External content"):
+            raw = raw.split("\n\n", 1)[1] if "\n\n" in raw else raw
+        if not raw.lstrip().startswith("<"):
+            return []
+        with suppress(Exception):
+            root = ET.fromstring(raw.encode("utf-8"))
+            root_name = root.tag.rsplit("}", 1)[-1].casefold()
+            if root_name not in {"rss", "feed", "rdf"} and not root.findall(".//item"):
+                return []
+            entries = root.findall(".//{*}entry") or root.findall(".//entry")
+            items = root.findall(".//{*}item") or root.findall(".//item")
+            rows: list[dict[str, str]] = []
+            for item in list(entries) + list(items):
+                title = AgentLoop._find_child_text(item, ("title",))
+                link = AgentLoop._find_child_link(item)
+                published = AgentLoop._find_child_text(item, ("published", "updated", "pubDate", "date"))
+                summary = AgentLoop._find_child_text(item, ("summary", "description", "content", "encoded"))
+                summary = re.sub(r"<[^>]+>", " ", summary)
+                summary = re.sub(r"\s+", " ", summary).strip()
+                if title or link or summary:
+                    rows.append({"title": title, "link": link, "published": published, "summary": summary})
+                if len(rows) >= max_items:
+                    break
+            return rows
+        return []
+
+    def _format_feed_items(self, items: list[dict[str, str]]) -> str:
+        max_chars = int(self._context_pipeline_cfg("max_final_evidence_chars", 1600))
+        lines: list[str] = []
+        for idx, item in enumerate(items, 1):
+            title = item.get("title") or "Untitled"
+            published = f" ({item.get('published')})" if item.get("published") else ""
+            summary = item.get("summary") or "No summary provided."
+            link = f" — {item.get('link')}" if item.get("link") else ""
+            line = f"{idx}. {title}{published}: {summary}{link}"
+            if len("\n".join(lines + [line])) > max_chars:
+                break
+            lines.append(line)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fetch_failure_message(data: dict[str, Any]) -> str | None:
+        error = str(data.get("error") or "").strip()
+        status = data.get("status")
+        if error:
+            if status:
+                return f"I could not fetch the URL directly: {status} {error}."
+            return f"I could not fetch the URL directly: {error}."
+        return None
+
+    async def _run_context_pipeline_web_fetch(
+        self,
+        ctx: TurnContext,
+        plan: dict[str, Any],
+    ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
+        request = ctx.msg.content.strip()
+        url = str(plan.get("url") or plan.get("query") or "").strip()
+        if not url:
+            urls = self._extract_urls(request)
+            url = urls[0] if urls else ""
+        if not url:
+            final = "I could not find a URL to fetch."
+            messages = [{"role": "user", "content": request}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
+
+        fetch_max = int(self._context_pipeline_cfg("fetch_max_chars", 3000))
+        logger.info("Context pipeline fetched_url={}", url)
+        fetched = await self.tools.execute(
+            "web_fetch",
+            {"url": url, "maxChars": fetch_max, "useJina": False, "extractMode": "markdown"},
+        )
+        ctx.prompt_injection_tools_used.append("web_fetch")
+        data = self._parse_fetch_result(fetched)
+        content_type = str(data.get("contentType") or data.get("content_type") or "").strip()
+        status = data.get("status", "")
+        final_url = str(data.get("finalUrl") or data.get("url") or url)
+        logger.info("Context pipeline fetched_url={}", final_url)
+        logger.info("Context pipeline content_type={}", content_type or "unknown")
+        logger.info("Context pipeline fetch_status={}", status or ("error" if data.get("error") else "unknown"))
+
+        if failure := self._fetch_failure_message(data):
+            messages = [{"role": "user", "content": request}, {"role": "assistant", "content": failure}]
+            return failure, list(ctx.prompt_injection_tools_used), messages, "completed", False
+
+        text = str(data.get("text") or "")[:fetch_max]
+        feed_items = self._parse_feed_items(text, int(self._context_pipeline_cfg("max_search_results", 5)))
+        logger.info("Context pipeline feed_items={}", len(feed_items))
+        if feed_items:
+            feed_text = self._format_feed_items(feed_items)
+            user_prompt = (
+                f"Original user request:\n{request}\n\n"
+                f"Fetched URL:\n{final_url}\n"
+                f"Content type:\n{content_type or 'RSS/XML/Atom'}\n\n"
+                f"Feed items:\n{feed_text}\n\n"
+                "Summarize the actual feed items. Include title, short summary, and link if available."
+            )
+            system = (
+                "You are a concise assistant. Use only these fetched RSS/Atom feed items. "
+                "Do not use unrelated search results or generic news summarizer pages."
+            )
+        else:
+            user_prompt = (
+                f"Original user request:\n{request}\n\n"
+                f"Fetched URL:\n{final_url}\n"
+                f"Content type:\n{content_type or 'unknown'}\n\n"
+                f"Fetched content:\n{text}\n\n"
+                "Answer the user using only this fetched URL content."
+            )
+            system = (
+                "You are a concise assistant. Use only the content fetched from the exact URL "
+                "the user provided. Do not substitute web search results."
+            )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user_prompt}]
+        messages = self._trim_plain_chat_to_context(messages)
+        response = await self._plain_provider_chat(messages, on_retry_wait=ctx.on_retry_wait)
+        self._last_usage = dict(response.usage or {})
+        final = response.content or EMPTY_FINAL_RESPONSE_MESSAGE
+        all_messages = list(messages)
+        all_messages.append({"role": "assistant", "content": final})
+        return final, list(ctx.prompt_injection_tools_used), all_messages, "completed", False
 
     def _format_context_pipeline_evidence(self, evidence: list[dict[str, Any]]) -> str:
         max_chars = int(self._context_pipeline_cfg("max_final_evidence_chars", 1600))
@@ -2058,6 +2328,13 @@ class AgentLoop:
         ctx: TurnContext,
     ) -> tuple[str | None, list[str], list[dict[str, Any]], str, bool]:
         request = ctx.msg.content.strip()
+        if exact := self._exact_reply_text(request):
+            messages = [{"role": "user", "content": request}, {"role": "assistant", "content": exact}]
+            return exact, [], messages, "completed", False
+        if self._message_has_unread_attachment_reference(ctx.msg, ctx.history):
+            final = self._attachment_unavailable_message()
+            messages = [{"role": "user", "content": request}, {"role": "assistant", "content": final}]
+            return final, [], messages, "completed", False
         plan = await self._context_pipeline_plan(
             request,
             ctx.on_retry_wait,
@@ -2077,6 +2354,8 @@ class AgentLoop:
             return await self._run_context_pipeline_cron(ctx, plan)
         if action == "escalate_cloud_agent":
             return await self._run_context_pipeline_cloud(ctx, plan)
+        if action == "web_fetch":
+            return await self._run_context_pipeline_web_fetch(ctx, plan)
         if action != "web_search":
             history = [item for item in ctx.history if isinstance(item, dict)] if self._context_pipeline_chat_history_enabled("answer_directly") else []
             ctx.initial_messages = self._build_context_pipeline_direct_messages(request, history)

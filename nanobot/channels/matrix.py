@@ -1149,8 +1149,9 @@ class MatrixChannel(BaseChannel):
             "event_id": str(getattr(event, "event_id", "") or ""),
             "encrypted": encrypted, "size_bytes": len(data),
             "path": str(path), "mxc_url": mxc_url,
+            "text_available": False,
         }
-        return attachment, _ATTACH_MARKER.format(path)
+        return attachment, _ATTACH_MARKER.format(filename)
 
     def _base_metadata(self, room: MatrixRoom, event: RoomMessage) -> dict[str, Any]:
         """Build common metadata for text and media handlers."""

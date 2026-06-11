@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1531,3 +1532,146 @@ def test_agent_loop_from_config_uses_top_level_memory_dream(tmp_path) -> None:
 
     assert loop.dream.skip_when_tools_unsupported is True
     assert loop.dream.plain_chat_fallback is False
+
+
+def test_context_pipeline_direct_url_forces_exact_web_fetch_and_feed_prompt(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(
+            supports_tools=False,
+            responses=["Feed summary from exact URL."],
+        )
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=8500,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+            context_pipeline=AgentDefaults.model_validate({
+                "contextPipeline": {
+                    "fetchMaxChars": 8000,
+                    "maxFinalEvidenceChars": 6000,
+                    "maxSearchResults": 5,
+                }
+            }).context_pipeline,
+        )
+        feed = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <item><title>First story</title><link>https://news.example/1</link><pubDate>Wed, 10 Jun 2026 09:00:00 GMT</pubDate><description>First summary.</description></item>
+  <item><title>Second story</title><link>https://news.example/2</link><description>Second summary.</description></item>
+</channel></rss>"""
+        loop.tools.execute = AsyncMock(return_value=json.dumps({
+            "url": "https://feeds.feedburner.com/kathimerini/DJpy",
+            "finalUrl": "https://feeds.feedburner.com/kathimerini/DJpy",
+            "status": 200,
+            "contentType": "application/rss+xml; charset=utf-8",
+            "text": feed,
+        }))
+
+        result = await loop._process_message(InboundMessage(
+            channel="matrix",
+            sender_id="@u:s",
+            chat_id="room",
+            content="https://feeds.feedburner.com/kathimerini/DJpy summarize the news",
+        ))
+
+        assert result is not None
+        assert result.content == "Feed summary from exact URL."
+        loop.tools.execute.assert_awaited_once()
+        tool_name, payload = loop.tools.execute.await_args.args
+        assert tool_name == "web_fetch"
+        assert payload["url"] == "https://feeds.feedburner.com/kathimerini/DJpy"
+        assert payload["useJina"] is False
+        assert provider.calls[0]["tools"] is None
+        prompt = "\n".join(str(message.get("content", "")) for message in provider.calls[0]["messages"])
+        assert "Feed items:" in prompt
+        assert "First story" in prompt
+        assert "https://news.example/1" in prompt
+        assert "google news" not in prompt.lower()
+        assert "nytimes" not in prompt.lower()
+    asyncio.run(run())
+
+
+def test_context_pipeline_direct_url_fetch_failure_does_not_search(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(supports_tools=False, responses=[])
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=8500,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        loop.tools.execute = AsyncMock(return_value=json.dumps({
+            "url": "https://feeds.feedburner.com/kathimerini/DJpy",
+            "status": 403,
+            "error": "Forbidden",
+        }))
+
+        result = await loop._process_message(InboundMessage(
+            channel="matrix",
+            sender_id="@u:s",
+            chat_id="room",
+            content="web fetch https://feeds.feedburner.com/kathimerini/DJpy",
+        ))
+
+        assert result is not None
+        assert result.content == "I could not fetch the URL directly: 403 Forbidden."
+        loop.tools.execute.assert_awaited_once()
+        assert loop.tools.execute.await_args.args[0] == "web_fetch"
+        assert provider.calls == []
+    asyncio.run(run())
+
+
+def test_context_pipeline_attachment_honesty_without_extracted_text(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(supports_tools=False, responses=["I read the PDF."])
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=8500,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        result = await loop._process_message(InboundMessage(
+            channel="matrix",
+            sender_id="@u:s",
+            chat_id="room",
+            content="have you read the PDF I attached?\n[attachment: report.pdf]",
+            metadata={"attachments": [{"filename": "report.pdf", "text_available": False}]},
+        ))
+
+        assert result is not None
+        assert result.content == AgentLoop._attachment_unavailable_message()
+        assert provider.calls == []
+    asyncio.run(run())
+
+
+def test_context_pipeline_exact_reply_short_circuits_model(tmp_path) -> None:
+    async def run() -> None:
+        provider = PlainFakeProvider(supports_tools=False, responses=["wrong"])
+        loop = AgentLoop(
+            bus=MessageBus(),
+            provider=provider,
+            workspace=tmp_path,
+            model="fake-small",
+            context_window_tokens=8500,
+            plain_chat_when_tools_unsupported=True,
+            tool_execution_mode="context_pipeline",
+        )
+        result = await loop._process_message(InboundMessage(
+            channel="matrix",
+            sender_id="@u:s",
+            chat_id="room",
+            content="reply exactly ATLAS_ONLINE_7429",
+        ))
+
+        assert result is not None
+        assert result.content == "ATLAS_ONLINE_7429"
+        assert provider.calls == []
+    asyncio.run(run())
