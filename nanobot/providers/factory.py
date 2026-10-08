@@ -101,6 +101,7 @@ def _make_provider_core(
             extra_headers=p.extra_headers if p else None,
             spec=spec,
             extra_body=p.extra_body if p else None,
+            thinking_style=p.thinking_style if p else None,
             api_type=p.api_type if p and provider_name == "openai" else "auto",
             capabilities=p.capabilities if p else None,
         )
@@ -188,6 +189,7 @@ def provider_signature(
             config.get_api_base(fallback.model, preset=fallback),
             fp.extra_headers if fp else None,
             fp.extra_body if fp else None,
+            fp.thinking_style if fp else None,
             fp.api_type if fp else "auto",
             fp.capabilities.model_dump() if fp else None,
             getattr(fp, "region", None) if fp else None,
@@ -206,6 +208,7 @@ def provider_signature(
         config.get_api_base(resolved.model, preset=resolved),
         p.extra_headers if p else None,
         p.extra_body if p else None,
+        p.thinking_style if p else None,
         p.api_type if p else "auto",
         p.capabilities.model_dump() if p else None,
         getattr(p, "region", None) if p else None,
