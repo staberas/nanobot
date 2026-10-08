@@ -5,6 +5,7 @@
       "model": "Qwen3-4B-w8a8-npu",
       "contextWindowTokens": 2048,
       "maxTokens": 160,
+      "reasoningEffort": "high",
       "maxToolIterations": 0,
       "plainChatWhenToolsUnsupported": true,
       "plainChatSystemPrompt": "You are a concise assistant. Reply in plain text only.",
@@ -95,6 +96,7 @@
     "rkllama": {
       "apiKey": null,
       "apiBase": "http://rkllama.default.svc.cluster.local:30082/v1",
+      "thinkingStyle": "enable_thinking",
       "capabilities": {
         "tools": false,
         "toolChoice": false,

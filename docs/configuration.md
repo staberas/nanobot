@@ -672,6 +672,30 @@ Some OpenAI-compatible gateways expose request-body extensions such as vLLM guid
 }
 ```
 
+For a local endpoint with a provider-specific thinking toggle, set `thinkingStyle` and
+select a `reasoningEffort` in the active model preset or agent defaults. Supported styles
+are `thinking_type` (`thinking.type`), `enable_thinking`, and `reasoning_split`. An explicit
+style takes precedence over model-name inference; leaving `reasoningEffort` unset preserves
+the server's default behavior.
+
+```json
+{
+  "providers": {
+    "rkllama": {
+      "apiBase": "http://rkllama:30082/v1",
+      "thinkingStyle": "enable_thinking"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "provider": "rkllama",
+      "model": "Qwen3-4B-w8a8-npu",
+      "reasoningEffort": "high"
+    }
+  }
+}
+```
+
 </details>
 
 <a id="local-providers"></a>
