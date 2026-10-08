@@ -92,7 +92,16 @@ def _model_thinking_style(model_name: str) -> str:
     return _MODEL_THINKING_STYLES.get(_model_slug(model_name), "")
 
 
-def _thinking_styles_for(spec: ProviderSpec | None, model_name: str) -> list[str]:
+def _thinking_styles_for(
+    spec: ProviderSpec | None,
+    model_name: str,
+    configured_style: str | None = None,
+) -> list[str]:
+    # An explicit provider setting describes the endpoint's wire protocol and
+    # must win over registry/model inference. Sending two toggle shapes can be
+    # rejected by otherwise OpenAI-compatible local servers.
+    if configured_style:
+        return [configured_style]
     styles: list[str] = []
     if spec and spec.thinking_style:
         styles.append(spec.thinking_style)
@@ -330,6 +339,7 @@ class OpenAICompatProvider(LLMProvider):
         extra_headers: dict[str, str] | None = None,
         spec: ProviderSpec | None = None,
         extra_body: dict[str, Any] | None = None,
+        thinking_style: str | None = None,
         api_type: str = "auto",
         capabilities: Any | None = None,
     ):
@@ -338,6 +348,7 @@ class OpenAICompatProvider(LLMProvider):
         self.extra_headers = extra_headers or {}
         self._spec = spec
         self._extra_body = extra_body or {}
+        self._thinking_style = thinking_style
         self._api_type = api_type if spec and spec.name == "openai" else "auto"
         self._capabilities = capabilities
 
@@ -365,7 +376,9 @@ class OpenAICompatProvider(LLMProvider):
         self._responses_tripped_at: dict[str, float] = {}
 
     def _capability(self, name: str, default: bool = True) -> bool:
-        caps = self._capabilities
+        # Some lightweight provider subclasses/test doubles bypass __init__.
+        # Missing capability configuration must retain the historical defaults.
+        caps = getattr(self, "_capabilities", None)
         if caps is None:
             return default
         if isinstance(caps, dict):
@@ -698,7 +711,9 @@ class OpenAICompatProvider(LLMProvider):
         # omitting the config preserves each provider's default.
         if reasoning_effort is not None:
             thinking_enabled = semantic_effort not in ("none", "minimal")
-            for thinking_style in _thinking_styles_for(spec, model_name):
+            for thinking_style in _thinking_styles_for(
+                spec, model_name, getattr(self, "_thinking_style", None)
+            ):
                 extra = _thinking_extra_body(thinking_style, thinking_enabled)
                 if extra:
                     kwargs.setdefault("extra_body", {}).update(extra)
@@ -735,7 +750,8 @@ class OpenAICompatProvider(LLMProvider):
             reasoning_effort is not None
             and semantic_effort not in ("none", "minimal")
             and (
-                (spec and spec.thinking_style)
+                getattr(self, "_thinking_style", None)
+                or (spec and spec.thinking_style)
                 or _model_thinking_style(model_name)
             )
         )
@@ -755,9 +771,10 @@ class OpenAICompatProvider(LLMProvider):
         # guided_json, repetition_penalty).  Uses recursive merge so
         # nested dicts like {"chat_template_kwargs": {"enable_thinking": false}}
         # do not clobber sibling keys already set by thinking-style logic.
-        if self._extra_body:
+        extra_body = getattr(self, "_extra_body", {})
+        if extra_body:
             existing = kwargs.get("extra_body", {})
-            kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
+            kwargs["extra_body"] = _deep_merge(existing, extra_body)
 
         if not self._capability("parallel_tool_calls", True):
             kwargs.pop("parallel_tool_calls", None)

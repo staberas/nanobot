@@ -1643,11 +1643,17 @@ def test_context_pipeline_attachment_honesty_without_extracted_text(tmp_path) ->
             sender_id="@u:s",
             chat_id="room",
             content="have you read the PDF I attached?\n[attachment: report.pdf]",
-            metadata={"attachments": [{"filename": "report.pdf", "text_available": False}]},
+            media=["/tmp/matrix/report.pdf"],
+            metadata={"attachments": [{
+                "filename": "report.pdf",
+                "path": "/tmp/matrix/report.pdf",
+                "text_available": False,
+            }]},
         ))
 
         assert result is not None
-        assert result.content == AgentLoop._attachment_unavailable_message()
+        assert "/tmp/matrix/report.pdf" in result.content
+        assert "text extraction is not implemented yet" in result.content
         assert provider.calls == []
     asyncio.run(run())
 
