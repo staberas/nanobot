@@ -92,7 +92,10 @@ def _model_thinking_style(model_name: str) -> str:
     return _MODEL_THINKING_STYLES.get(_model_slug(model_name), "")
 
 
-def _thinking_styles_for(spec: ProviderSpec | None, model_name: str) -> list[str]:
+def _thinking_styles_for(
+    spec: ProviderSpec | None,
+    model_name: str,
+) -> list[str]:
     styles: list[str] = []
     if spec and spec.thinking_style:
         styles.append(spec.thinking_style)
@@ -365,7 +368,9 @@ class OpenAICompatProvider(LLMProvider):
         self._responses_tripped_at: dict[str, float] = {}
 
     def _capability(self, name: str, default: bool = True) -> bool:
-        caps = self._capabilities
+        # Some lightweight provider subclasses/test doubles bypass __init__.
+        # Missing capability configuration must retain the historical defaults.
+        caps = getattr(self, "_capabilities", None)
         if caps is None:
             return default
         if isinstance(caps, dict):
@@ -755,9 +760,10 @@ class OpenAICompatProvider(LLMProvider):
         # guided_json, repetition_penalty).  Uses recursive merge so
         # nested dicts like {"chat_template_kwargs": {"enable_thinking": false}}
         # do not clobber sibling keys already set by thinking-style logic.
-        if self._extra_body:
+        extra_body = getattr(self, "_extra_body", {})
+        if extra_body:
             existing = kwargs.get("extra_body", {})
-            kwargs["extra_body"] = _deep_merge(existing, self._extra_body)
+            kwargs["extra_body"] = _deep_merge(existing, extra_body)
 
         if not self._capability("parallel_tool_calls", True):
             kwargs.pop("parallel_tool_calls", None)
