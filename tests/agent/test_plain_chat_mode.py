@@ -997,6 +997,16 @@ def test_context_pipeline_chat_history_strips_attachment_paths(tmp_path) -> None
     asyncio.run(run())
 
 
+def test_context_pipeline_history_cleaner_strips_windows_image_paths() -> None:
+    content = (
+        "see attached\n"
+        "[image: C:\\Users\\alice\\AppData\\Local\\Temp\\private-image.png]\n"
+        "[image: \\\\server\\share\\private-image.png]"
+    )
+
+    assert AgentLoop._context_pipeline_clean_history_text(content) == "see attached"
+
+
 def test_context_pipeline_new_clears_direct_chat_history(tmp_path) -> None:
     async def run() -> None:
         provider = PlainFakeProvider(

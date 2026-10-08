@@ -1038,7 +1038,11 @@ class AgentLoop:
             line = raw.strip()
             if not line:
                 continue
-            if re.match(r"^\[image:\s*(?:/|~)[^\]]*\]$", line, flags=re.I):
+            if re.match(
+                r"^\[image:\s*(?:(?:/|~)[^\]]*|[A-Z]:[\\/][^\]]*|\\\\[^\]]*)\]$",
+                line,
+                flags=re.I,
+            ):
                 continue
             if re.match(r"^\[(?:CLI App Attachment|MCP Preset Attachment):.*\]$", line, flags=re.I):
                 continue
