@@ -846,10 +846,30 @@ class AgentLoop:
         return has_media or has_attachment_marker or (asks_about_attachment and history_has_unread_marker)
 
     @staticmethod
-    def _attachment_unavailable_message() -> str:
+    def _attachment_unavailable_message(msg: InboundMessage | None = None) -> str:
+        """Describe an unextracted attachment without pretending its contents were read."""
+        paths: list[str] = []
+        if msg is not None:
+            for path in msg.media or []:
+                if isinstance(path, str) and path.strip() and path not in paths:
+                    paths.append(path)
+            for attachment in (msg.metadata or {}).get("attachments", []) or []:
+                if not isinstance(attachment, dict):
+                    continue
+                path = attachment.get("path")
+                if isinstance(path, str) and path.strip() and path not in paths:
+                    paths.append(path)
+
+        if paths:
+            rendered_paths = ", ".join(f"`{path}`" for path in paths)
+            return (
+                f"I received the attachment at the local media path {rendered_paths}, "
+                "but PDF/file text extraction is not implemented yet. Paste the text "
+                "or use a PDF ingestion path."
+            )
         return (
-            "I can see that a file was attached or mentioned, but I cannot read Matrix "
-            "attachments yet. Paste the text or use a PDF ingestion path."
+            "I received a file attachment, but PDF/file text extraction is not implemented "
+            "yet. Paste the text or use a PDF ingestion path."
         )
 
     def _format_prompt_injection_result(self, tool_name: str, query: str, result: Any) -> str:
@@ -2332,7 +2352,7 @@ class AgentLoop:
             messages = [{"role": "user", "content": request}, {"role": "assistant", "content": exact}]
             return exact, [], messages, "completed", False
         if self._message_has_unread_attachment_reference(ctx.msg, ctx.history):
-            final = self._attachment_unavailable_message()
+            final = self._attachment_unavailable_message(ctx.msg)
             messages = [{"role": "user", "content": request}, {"role": "assistant", "content": final}]
             return final, [], messages, "completed", False
         plan = await self._context_pipeline_plan(

@@ -92,7 +92,16 @@ def _model_thinking_style(model_name: str) -> str:
     return _MODEL_THINKING_STYLES.get(_model_slug(model_name), "")
 
 
-def _thinking_styles_for(spec: ProviderSpec | None, model_name: str) -> list[str]:
+def _thinking_styles_for(
+    spec: ProviderSpec | None,
+    model_name: str,
+    configured_style: str | None = None,
+) -> list[str]:
+    # An explicit provider setting describes the endpoint's wire protocol and
+    # must win over registry/model inference. Sending two toggle shapes can be
+    # rejected by otherwise OpenAI-compatible local servers.
+    if configured_style:
+        return [configured_style]
     styles: list[str] = []
     if spec and spec.thinking_style:
         styles.append(spec.thinking_style)
@@ -330,6 +339,7 @@ class OpenAICompatProvider(LLMProvider):
         extra_headers: dict[str, str] | None = None,
         spec: ProviderSpec | None = None,
         extra_body: dict[str, Any] | None = None,
+        thinking_style: str | None = None,
         api_type: str = "auto",
         capabilities: Any | None = None,
     ):
@@ -338,6 +348,7 @@ class OpenAICompatProvider(LLMProvider):
         self.extra_headers = extra_headers or {}
         self._spec = spec
         self._extra_body = extra_body or {}
+        self._thinking_style = thinking_style
         self._api_type = api_type if spec and spec.name == "openai" else "auto"
         self._capabilities = capabilities
 
@@ -698,7 +709,9 @@ class OpenAICompatProvider(LLMProvider):
         # omitting the config preserves each provider's default.
         if reasoning_effort is not None:
             thinking_enabled = semantic_effort not in ("none", "minimal")
-            for thinking_style in _thinking_styles_for(spec, model_name):
+            for thinking_style in _thinking_styles_for(
+                spec, model_name, self._thinking_style
+            ):
                 extra = _thinking_extra_body(thinking_style, thinking_enabled)
                 if extra:
                     kwargs.setdefault("extra_body", {}).update(extra)
@@ -735,7 +748,8 @@ class OpenAICompatProvider(LLMProvider):
             reasoning_effort is not None
             and semantic_effort not in ("none", "minimal")
             and (
-                (spec and spec.thinking_style)
+                self._thinking_style
+                or (spec and spec.thinking_style)
                 or _model_thinking_style(model_name)
             )
         )
