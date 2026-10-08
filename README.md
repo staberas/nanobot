@@ -35,6 +35,7 @@
 
 ## 📢 News
 
+- **2026-10-08** 🚀 Released **v0.2.2** — **The Local Reasoning & Matrix Reliability Release** adds configurable RKLLAMA/OpenAI-compatible thinking payloads, safer Matrix media and thread handling, attachment-path honesty, and cross-platform history sanitation while preserving the fork's Hermes, Atlas, and context-pipeline behavior. See the [v0.2.2 changelog](./CHANGELOG.md#022---2026-10-08) for details.
 - **2026-06-01** 🚀 Released **v0.2.1** — **The Workbench Release** turns the packaged WebUI into a daily agent workbench: clearer Thought/response timelines, live file-edit activity, project workspaces, model and context controls, steadier sustained goals, CLI Apps + MCP extensions, and broader provider/channel support. Please see [release notes](https://github.com/HKUDS/nanobot/releases/tag/v0.2.1) for details.
 - **2026-05-30** 🔐 Safer Matrix verification, bounded media downloads, clearer WebUI model timeline.
 - **2026-05-29** 🧩 Extension registry, context-window tuning, document extraction controls.
