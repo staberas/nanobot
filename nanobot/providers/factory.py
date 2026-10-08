@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from nanobot.config.schema import Config, InlineFallbackConfig, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.fallback_provider import FallbackProvider
-from nanobot.providers.registry import find_by_name
+from nanobot.providers.registry import ProviderSpec, find_by_name
 
 
 @dataclass(frozen=True)
@@ -42,6 +42,19 @@ def _make_provider_core(
     provider_name = config.get_provider_name(model, preset=resolved)
     p = config.get_provider(model, preset=resolved)
     spec = find_by_name(provider_name) if provider_name else None
+    if spec is not None and p is not None and p.thinking_style:
+        spec = replace(spec, thinking_style=p.thinking_style)
+    elif spec is None and p is not None and provider_name:
+        # Named custom providers use the same immutable metadata path as built-ins.
+        # Keeping thinking style on the spec avoids adding parallel provider state.
+        spec = ProviderSpec(
+            name=provider_name,
+            keywords=(),
+            env_key="",
+            display_name=provider_name,
+            is_direct=True,
+            thinking_style=p.thinking_style or "",
+        )
     backend = spec.backend if spec else "openai_compat"
     env_api_key = os.environ.get(spec.env_key) if spec and spec.env_key else None
     api_key = (p.api_key if p else None) or env_api_key
@@ -189,13 +202,14 @@ def provider_signature(
             fp.extra_headers if fp else None,
             fp.extra_body if fp else None,
             fp.api_type if fp else "auto",
-            fp.capabilities.model_dump() if fp else None,
             getattr(fp, "region", None) if fp else None,
             getattr(fp, "profile", None) if fp else None,
             fallback.max_tokens,
             fallback.temperature,
             fallback.reasoning_effort,
             fallback.context_window_tokens,
+            fp.capabilities.model_dump() if fp else None,
+            fp.thinking_style if fp else None,
         )
 
     return (
@@ -207,13 +221,14 @@ def provider_signature(
         p.extra_headers if p else None,
         p.extra_body if p else None,
         p.api_type if p else "auto",
-        p.capabilities.model_dump() if p else None,
         getattr(p, "region", None) if p else None,
         getattr(p, "profile", None) if p else None,
         resolved.max_tokens,
         resolved.temperature,
         resolved.reasoning_effort,
         resolved.context_window_tokens,
+        p.capabilities.model_dump() if p else None,
+        p.thinking_style if p else None,
         tuple(_fallback_signature(fallback) for fallback in fallback_presets),
     )
 

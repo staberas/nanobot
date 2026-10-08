@@ -247,7 +247,7 @@ class AgentDefaults(Base):
     context_pipeline: ContextPipelineConfig = Field(default_factory=ContextPipelineConfig)
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")
-    bot_icon: str = ""  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
+    bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
     session_ttl_minutes: int = Field(
@@ -313,6 +313,7 @@ class ProviderConfig(Base):
     api_type: Literal["auto", "chat_completions", "responses"] = "auto"  # Request API surface
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     extra_body: dict[str, Any] | None = None  # Extra provider request fields; shape depends on provider/API surface
+    thinking_style: Literal["", "thinking_type", "enable_thinking", "reasoning_split"] | None = None
     capabilities: ProviderCapabilitiesConfig = Field(default_factory=ProviderCapabilitiesConfig)
 
 
