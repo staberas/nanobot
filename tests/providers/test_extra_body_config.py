@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+from pydantic import ValidationError
+
+from nanobot.config.schema import Config, ProviderConfig
+from nanobot.providers.factory import make_provider, provider_signature
 from nanobot.providers.openai_compat_provider import (
     OpenAICompatProvider,
     _deep_merge,
@@ -75,6 +80,85 @@ class TestExtraBodyInit:
         body = {"chat_template_kwargs": {"enable_thinking": False}}
         provider = OpenAICompatProvider(api_key="test", extra_body=body)
         assert provider._extra_body == body
+
+
+class TestConfiguredThinkingStyle:
+    """Verify custom/local providers can select their thinking wire format."""
+
+    @pytest.mark.parametrize(
+        ("style", "expected"),
+        [
+            ("thinking_type", {"thinking": {"type": "enabled"}}),
+            ("enable_thinking", {"enable_thinking": True}),
+            ("reasoning_split", {"reasoning_split": True}),
+        ],
+    )
+    def test_style_maps_reasoning_effort_to_request_body(
+        self, style: str, expected: dict[str, Any]
+    ) -> None:
+        provider = OpenAICompatProvider(
+            api_base="http://rkllama.local/v1",
+            default_model="local-model",
+            thinking_style=style,
+        )
+
+        kwargs = provider._build_kwargs(
+            messages=_simple_messages(),
+            tools=None,
+            model=None,
+            max_tokens=100,
+            temperature=0.1,
+            reasoning_effort="high",
+            tool_choice=None,
+        )
+
+        assert kwargs["extra_body"] == expected
+
+    def test_explicit_style_overrides_model_inference(self) -> None:
+        provider = OpenAICompatProvider(
+            default_model="kimi-k2.5",
+            thinking_style="enable_thinking",
+        )
+
+        kwargs = provider._build_kwargs(
+            messages=_simple_messages(),
+            tools=None,
+            model=None,
+            max_tokens=100,
+            temperature=0.1,
+            reasoning_effort="none",
+            tool_choice=None,
+        )
+
+        assert kwargs["extra_body"] == {"enable_thinking": False}
+        assert "thinking" not in kwargs["extra_body"]
+
+    def test_config_rejects_unknown_style(self) -> None:
+        with pytest.raises(ValidationError):
+            ProviderConfig.model_validate({"thinkingStyle": "rkllama_magic"})
+
+    def test_factory_passes_style_and_tracks_it_in_signature(self) -> None:
+        config = Config.model_validate({
+            "agents": {
+                "defaults": {
+                    "provider": "rkllama",
+                    "model": "Qwen3-4B-w8a8-npu",
+                }
+            },
+            "providers": {
+                "rkllama": {
+                    "apiBase": "http://rkllama.local/v1",
+                    "thinkingStyle": "enable_thinking",
+                    "capabilities": {"tools": False},
+                }
+            },
+        })
+
+        provider = make_provider(config)
+
+        assert isinstance(provider, OpenAICompatProvider)
+        assert provider._thinking_style == "enable_thinking"
+        assert "enable_thinking" in provider_signature(config)
 
 
 # ---------------------------------------------------------------------------

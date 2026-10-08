@@ -313,6 +313,7 @@ class ProviderConfig(Base):
     api_type: Literal["auto", "chat_completions", "responses"] = "auto"  # Request API surface
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
     extra_body: dict[str, Any] | None = None  # Extra provider request fields; shape depends on provider/API surface
+    thinking_style: Literal["thinking_type", "enable_thinking", "reasoning_split"] | None = None
     capabilities: ProviderCapabilitiesConfig = Field(default_factory=ProviderCapabilitiesConfig)
 
 
